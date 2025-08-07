@@ -1051,21 +1051,9 @@ function generateDay30HtmlReport(data) {
   return template.evaluate().getContent();
 }
 
-// ===============================
-// 99. testSendMessageToMyself()★★★
-// （任意のメッセージを userId 宛に送信）
-// ===============================
-function testSendMessageToMyself() {
-  const userId = 'U84cb68bb799a0263ceafd8da755e659b';
-  const message = {
-    type: 'text',
-    text: '✅ テスト送信成功：このメッセージが届けばLINE送信は正常です。'
-  };
-  sendLineMessage(userId, message);
-}
 
 // ===============================
-// 30. sendDay30PdfLinkToUser()★★★
+// 30. sendDay30PdfLinkToUser()
 // ===============================
 function sendDay30PdfLinkToUser(userId, pdfUrl) {
   const sheet = SpreadsheetApp.openById(SHEET_ID).getSheetByName(SHEET_NAME);
@@ -1081,12 +1069,6 @@ function sendDay30PdfLinkToUser(userId, pdfUrl) {
   };
   pushLineMessage(userId, message);
 }
-function testSend() {
-  const userId = 'U84cb68bb799a0263ceafd8da755e659b';
-  const message = { type: 'text', text: 'Day17〜23 メッセージテスト送信です。' };
-  sendLineMessage(userId, message); // LINE送信関数
-}
-
 // ===============================
 // 31．processDay30SummaryAnalysis()★★★ PDF生成なし版
 // ===============================
@@ -1436,8 +1418,8 @@ function generateDay30HtmlReport(parsed) {
 // ===============================
 // 53．DAY30_PDF_FOLDER_ID（定数宣言）
 // ===============================
-// Day30診断PDFを保存するGoogle DriveフォルダのIDをここに設定
-const DAY30_PDF_FOLDER_ID = '1rXtBp81azYvlQ9xdYxOwmnl3uac7aB4RemdcjtmsW_0'; // 例：実際のDriveフォルダIDに置き換え
+// Day30診断PDFを保存するGoogle DriveフォルダのIDをここに設定してください。
+const DAY30_PDF_FOLDER_ID = '1rXtBp81azYvlQ9xdYxOwmnl3uac7aB4RemdcjtmsW_0'; // 例：実際のDriveフォルダIDに置き換えてください
 
 // ===============================
 // 41．uploadHtmlToDriveAndGetUrl()★★
