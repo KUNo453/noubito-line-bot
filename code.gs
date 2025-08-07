@@ -1074,7 +1074,7 @@ function sendDay30PdfLinkToUser(userId, pdfUrl) {
 // ===============================
 function processDay30SummaryAnalysis() {
   try {
-    const userId = "U84cb68bb799a0263ceafd8da755e659b";  // ←本番は自動取得
+    const userId = "U";  // ←本番は自動取得
     const parsed = {
       typeName: "静かな構想家（INTJ）",
       typeDescription: "あなたは内面の整合性を重視し、論理と直感で未来を描く構想型です。",
