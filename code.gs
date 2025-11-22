@@ -1,2129 +1,2782 @@
-// ===============================
-// 1．Webhook受信（即時レスポンス版）
-// ===============================
-function doPost(e) {
+/************************************************************
+ * PART 0: 共通設定・ユーティリティ（強化版）
+ ************************************************************/
+const PROP = (() => {
+  const p = PropertiesService.getScriptProperties();
+  const get = (k, def='') => {
+    const v = p.getProperty(k);
+    return v ? String(v).trim() : def;
+  };
+  const C = {
+    OPENAI_API_KEY:       get('OPENAI_API_KEY'),
+    OPENWEATHER_API_KEY:  get('OPENWEATHER_API_KEY'),
+    CHANNEL_ACCESS_TOKEN: get('CHANNEL_ACCESS_TOKEN'),
+    CITY_NAME:            get('CITY_NAME', ''),
+    // ★ 追加（管理シート）
+    SHEET_ID_M:           get('SHEET_ID_M'),
+    SHEET_ID_N:           get('SHEET_ID_N'),
+    // ★ 追加（エラーメールの送信先）
+    ADMIN_EMAIL:          get('ADMIN_EMAIL', ''),
+  };
+  // 最低限の必須チェック（稼働前に気付ける）
+  const missing = [];
+  ['CHANNEL_ACCESS_TOKEN'].forEach(k => { if (!C[k]) missing.push(k); });
+  if (missing.length) Logger.log('⚠️ Missing Script Properties: ' + missing.join(', '));
+  return C;
+})();
+
+
+/************************************************************
+ * PART 0: ログ通知ユーティリティ（Gmail通知対応）
+ * ※チームの場合Slackが有料ならSlackへ送る
+ ************************************************************/
+function logErr(msg, err) {
+  const errorText = `❌ ERROR: ${msg}\n${err && err.stack ? err.stack : err}`;
+  Logger.log(errorText);
+
+  // ADMIN_EMAIL が未設定ならメール送信しない
+  if (!PROP.ADMIN_EMAIL) return;
+
   try {
-    // 即時レスポンスでLINEエラーを防止
-    const response = ContentService.createTextOutput("OK");
-
-    // 本処理は非同期で分離
-    handleLineEventAsync(e);
-    return response;
-  } catch (error) {
-    Logger.log("❌ doPost error: " + error.toString());
-    return ContentService.createTextOutput("Error");
-  }
-}
-// ===============================
-// 1-A．handleLineEventAsync（Day17〜30の回答処理分岐）
-// ===============================
-function handleLineEventAsync(e) {
-  const message = getMessageTextFromEvent(e);
-
-  // Day17〜23（Day21のみGPT採点）
-  if (
-    message.startsWith("#Day17") ||
-    message.startsWith("#Day18") ||
-    message.startsWith("#Day19") ||
-    message.startsWith("#Day20") ||
-    message.startsWith("#Day21") ||
-    message.startsWith("#Day22") ||
-    message.startsWith("#Day23")
-  ) {
-    processDay17to23Answer(e); // ← 関数13-A：GPTあり／なし判定付き採点処理
-    return;
-  }
-
-  // Day24〜29（すべてGPT採点）
-  const dayMatch = message.match(/^#Day(\d{2})/);
-  if (dayMatch) {
-    const day = parseInt(dayMatch[1], 10);
-    if (day >= 24 && day <= 29) {
-      processDayAnswer(day, e); // ← 関数15：GPTスコア＋コメント
-      return;
-    }
-  }
-
-  // Day30以降やその他の処理が必要な場合はここに追加
-}
-
-// ===============================
-// 2．Webhook本体処理（非同期）
-// ===============================
-function handleLineEventAsync(e) {
-  if (!e || !e.postData || !e.postData.contents) return;
-
-  const json = JSON.parse(e.postData.contents);
-  const events = json.events;
-  if (!Array.isArray(events) || events.length === 0) return;
-
-  for (let i = 0; i < events.length; i++) {
-    const event = events[i];
-    const userId = event?.source?.userId || null;
-    if (!userId) continue;
-    const text = event.message?.text?.trim();
-    if (!text) continue;
-
-    // ✅ スタート登録（先返信・後登録）
-    if (event.type === 'message' && text === 'スタート') {
-      sendTextMessage(userId, `登録が完了しました🌿\n明日から毎朝6:00にメッセージをお届けします🕊`);
-      try {
-        const profile = UrlFetchApp.fetch(`https://api.line.me/v2/bot/profile/${userId}`, {
-          method: 'get',
-          headers: { Authorization: 'Bearer ' + CHANNEL_ACCESS_TOKEN }
-        });
-        const displayName = JSON.parse(profile.getContentText()).displayName;
-        registerUserIfNotExists(userId, displayName);
-      } catch (e) {
-        Logger.log("❌ プロフィール取得失敗: " + e.toString());
-        registerUserIfNotExists(userId);  // fallback
-      }
-      continue;
-    }
-
-    // ✅ Day17〜23（Day21のみGPT）
-    if (/^#Day(1[7-9]|2[0-3])/i.test(text)) {
-      processDay17to23Answer(e); // 関数13-A
-      continue;
-    }
-
-    // ✅ Day24〜29（回答保存処理）
-    if (/^#Day24/i.test(text)) {
-      processDay24Answer(event, userId, text); // 関数20
-      continue;
-    }
-    if (/^#Day25/i.test(text)) {
-      processDay25Answer(userId, text); // 関数21
-      continue;
-    }
-    if (/^#Day26/i.test(text)) {
-      processDay26Answer(userId, text); // 関数22
-      continue;
-    }
-    if (/^#Day27/i.test(text)) {
-      processDay27Answer(userId, text); // 関数23
-      continue;
-    }
-    if (/^#Day28/i.test(text)) {
-      processDay28Answer(userId, text); // 関数24
-      continue;
-    }
-    if (/^#Day29/i.test(text)) {
-      processDay29Answer(userId, text); // 関数25
-      continue;
-    }
-
-    // ✅ ハッシュタグ自由記述系（Day13夜など）
-    if (text.includes('#')) {
-      handleHashtagInput(userId, text);
-      continue;
-    }
-
-    // ✅ MBTI入力処理
-    if (isMbtiType(text)) {
-      saveMbtiType(userId, text.toUpperCase());
-      sendTextMessage(userId, `🧠 MBTIタイプ「${text.toUpperCase()}」を受け取りました！`);
-      continue;
-    }
-  }
-}
-
-// ===============================
-// ３．MBTI判定（INFPなど）
-// ===============================
-function isMbtiType(text) {
-  const mbtiTypes = ["INTJ", "INTP", "ENTJ", "ENTP", "INFJ", "INFP", "ENFJ", "ENFP",
-                     "ISTJ", "ISFJ", "ESTJ", "ESFJ", "ISTP", "ISFP", "ESTP", "ESFP"];
-  return mbtiTypes.includes(text.trim().toUpperCase());
-}
-
-// ===============================
-// 4．MBTIタイプ判定・保存
-// ===============================
-function isMbtiType(text) {
-  const mbtiTypes = ["INTJ", "INTP", "ENTJ", "ENTP", "INFJ", "INFP", "ENFJ", "ENFP",
-                     "ISTJ", "ISFJ", "ESTJ", "ESFJ", "ISTP", "ISFP", "ESTP", "ESFP"];
-  return mbtiTypes.includes(text.trim().toUpperCase());
-}
-
-function saveMbtiType(userId, mbti) {
-  const sheet = SpreadsheetApp.openById(SHEET_ID).getSheetByName(SHEET_NAME);
-  const data = sheet.getDataRange().getValues();
-  for (let i = 1; i < data.length; i++) {
-    if (data[i][0] === userId) {
-      sheet.getRange(i + 1, 6).setValue(mbti);
-      break;
-    }
-  }
-}
-
-// ===============================
-// 5．LINEテキスト返信（共通）
-// ===============================
-function sendTextMessage(userId, text) {
-  const payload = {
-    to: userId,
-    messages: [{ type: "text", text: text }]
-  };
-
-  const options = {
-    method: "post",
-    headers: {
-      "Content-Type": "application/json",
-      "Authorization": "Bearer " + CHANNEL_ACCESS_TOKEN
-    },
-    payload: JSON.stringify(payload),
-    muteHttpExceptions: true
-  };
-
-  const response = UrlFetchApp.fetch("https://api.line.me/v2/bot/message/push", options);
-  const code = response.getResponseCode();
-
-  if (code !== 200) {
-    Logger.log("❌ LINEメッセージ送信失敗: " + code + " - " + response.getContentText());
-  } else {
-    Logger.log("✅ LINEメッセージ送信成功: " + code);
-  }
-}
-
-// ===============================
-// ６．#ネガティブなどのハッシュタグ記録
-// ===============================
-function handleHashtagInput(userId, text) {
-  const hashtagColumnMap = {
-    "#ネガティブ": 7
-  };
-
-  const matched = Object.keys(hashtagColumnMap).find(tag => text.startsWith(tag));
-  if (!matched) return;
-
-  const sheet = SpreadsheetApp.openById(SHEET_ID).getSheetByName(SHEET_NAME);
-  const data = sheet.getDataRange().getValues();
-  const rowIndex = data.findIndex(row => row[0] === userId);
-  if (rowIndex === -1) return;
-
-  const value = text.replace(matched, "").trim();
-  const colIndex = hashtagColumnMap[matched];
-  if (value !== "") {
-    sheet.getRange(rowIndex + 1, colIndex).setValue(value);
-    Logger.log(`📌 ${matched} → ${value} を ${colIndex}列に記録しました`);
-  }
-}
-// ===============================
-// 7．スプレッドシートに登録（重複チェック・初期値Day=0）
-// ===============================
-function registerUserIfNotExists(userId) {
-  try {
-    const sheet = SpreadsheetApp.openById(SHEET_ID).getSheetByName(SHEET_NAME);
-    const data = sheet.getDataRange().getValues();
-    const now = new Date();
-
-    const profileUrl = `https://api.line.me/v2/bot/profile/${userId}`;
-    const response = UrlFetchApp.fetch(profileUrl, {
-      method: 'get',
-      headers: {
-        'Authorization': 'Bearer ' + CHANNEL_ACCESS_TOKEN
-      }
-    });
-    const profile = JSON.parse(response.getContentText());
-    const displayName = profile.displayName || "";
-
-    const existingIndex = data.findIndex(row => row[0] === userId);
-    if (existingIndex !== -1) {
-      // ✅ 既存ユーザー → 名前・状態の更新、Day数はリセット
-      sheet.getRange(existingIndex + 1, 2).setValue(displayName); // B列：名前
-      sheet.getRange(existingIndex + 1, 4).setValue("active");    // D列：状態
-      sheet.getRange(existingIndex + 1, 5).setValue(0);           // E列：Day数
-      return;
-    }
-
-    // ✅ 新規ユーザー登録（A〜E列のみ初期化。残り列は空のまま）
-    sheet.appendRow([
-      userId,         // A列：userId
-      displayName,    // B列：名前
-      now,            // C列：登録日
-      "active",       // D列：状態
-      0               // E列：Day数（初期値）
-      // F列以降は空欄として省略（自動で空になる）
-    ]);
+    GmailApp.sendEmail(
+      PROP.ADMIN_EMAIL,
+      `【noubito GAS】エラー発生: ${msg}`,
+      `日時: ${new Date().toLocaleString('ja-JP')}\n\n${errorText}`
+    );
   } catch (e) {
-    Logger.log("❌ registerUserIfNotExists エラー: " + e.toString());
+    Logger.log('⚠️ Gmail送信に失敗しました: ' + e);
   }
 }
 
-// ===============================
-// 8．Flex Messageによるスタートメッセージ送信
-// ===============================
-function sendStartFlexMessage(userId) {
-  const displayName = getDisplayName(userId) || "ご登録者";
+/**★★★★★★★★★★★★一旦残すコード★★★★★★★★★★★★★★★★★★★★★*/
+/**★★★★★★★★★★★★一旦残すコード★★★★★★★★★★★★★★★★★★★★★*/
+// 指定スプレッドシートを開く（ID または URL どちらでもOK）＋タブ名で取得
+//  - /d/{ID}/ 形式 と ?id=ID 形式 の両方から抽出
 
-  const flexMessage = {
-    to: userId,
-    messages: [
-      {
-        type: "flex",
-        altText: `${displayName}さん、ご登録ありがとうございます🌱`,
-        contents: {
-          type: "bubble",
-          hero: {
-            type: "image",
-            url: "https://drive.google.com/uc?export=view&id=1X3vYm8gvJfKIxJ5gQ9VW740OeXEuHllt",
-            size: "full",
-            aspectRatio: "3:4",
-            aspectMode: "cover"
-          },
-          body: {
-            type: "box",
-            layout: "vertical",
-            contents: [
-              {
-                type: "text",
-                text: "🌱 スタートありがとうございます。",
-                weight: "bold",
-                wrap: true,
-                size: "md"
-              },
-              {
-                type: "text",
-                text:
-                  "植物と天気を通じて、心と脳を整える”読む瞑想”を毎朝そっとお届けしていきます🍀。どうぞお楽しみに！",
-                wrap: true,
-                size: "sm",
-                margin: "md"
-              }
-            ]
-          }
-        }
-      }
-    ]
+function openSheetByIdAndName(sheetIdOrUrl, sheetName) {
+  const extractId = (s) => {
+    if (!s) return '';
+    const str = String(s).trim();
+    // 1) /d/{ID}/ パターン
+    let m = str.match(/\/d\/([a-zA-Z0-9-_]+)/);
+    if (m) return m[1];
+    // 2) ?id= または &id= パターン（drive の「open?id=...」等）
+    m = str.match(/[?&]id=([a-zA-Z0-9-_]+)/);
+    if (m) return m[1];
+    // 3) それ以外はそのまま（すでにIDだけが入っている想定）
+    return str;
   };
+  const id = extractId(sheetIdOrUrl);
+  if (!id) throw new Error('Sheet ID is empty. Check Script Properties: SHEET_ID_M / SHEET_ID_N');
+  logInfo('openSheetByIdAndName.extract', { given: sheetIdOrUrl, extractedId: id, sheetName });
 
-  UrlFetchApp.fetch("https://api.line.me/v2/bot/message/push", {
-    method: "post",
-    contentType: "application/json",
-    headers: {
-      Authorization: "Bearer " + CHANNEL_ACCESS_TOKEN
-    },
-    payload: JSON.stringify(flexMessage),
-    muteHttpExceptions: true  // ✅ 念のためレスポンス取得可能に
-  });
-}
-
-// ===============================
-//9．天気情報の取得
-// ===============================
-function getWeather() {
-  const url = `https://api.openweathermap.org/data/2.5/weather?q=${CITY_NAME}&appid=${OPENWEATHER_API_KEY}&units=metric&lang=ja`;
+  let ss;
   try {
-    const response = UrlFetchApp.fetch(url);
-    const data = JSON.parse(response.getContentText());
-    Logger.log("📝 天気の説明: " + (data.weather?.[0]?.description || "情報なし"));
-    return {
-      description: data.weather?.[0]?.description || "天気情報なし",
-      temp: data.main?.temp ?? null,
-      humidity: data.main?.humidity ?? null
-    };
+    ss = SpreadsheetApp.openById(id);
   } catch (e) {
-    Logger.log("❌ 天気取得エラー: " + e);
-    return {
-      description: "天気取得失敗",
-      temp: null,
-      humidity: null
-    };
+    throw new Error(`openById failed. Given="${sheetIdOrUrl}" extracted="${id}". Use ONLY the spreadsheet ID. Original error: ${e}`);
   }
+  const sh = ss.getSheetByName(sheetName);
+  if (!sh) throw new Error(`Sheet not found: "${sheetName}" in spreadsheet id=${id}`);
+  return sh;
 }
-
-// ===============================
-// 10．Day別 朝メッセージ用プロンプト生成（Day=0〜対応）
-// ===============================
-function generatePromptFromWeatherAndDay(weather, day) {
-  const tempText = (typeof weather.temp === 'number')
-    ? `${weather.temp.toFixed(1)}℃`
-    : "不明";
-
-  const humidityText = (typeof weather.humidity === 'number')
-    ? `${weather.humidity}%`
-    : "不明";
-
-  const description = weather.description || "天気不明";
-  const numericDay = (!isNaN(Number(day))) ? Number(day) : 0;
-
-  // Day10〜16：脳トレ導入フェーズ（サトリ文体＋トレーニング指示）
-  if (numericDay >= 10 && numericDay <= 16) {
-    const dayThemes = {
-      10: { title: "選べる自分になる", training: "【1】5秒我慢法", focus: "衝動抑制・自己制御" },
-      11: { title: "一音に集中してみる", training: "【2】RAS強化ワーク", focus: "注意制御・選択的集中" },
-      12: { title: "自分を実況してみる", training: "【3】実況中継ワーク", focus: "メタ認知・感情観察" },
-      13: { title: "逆さことばで脳を遊ばせる", training: "【4】逆復唱ワーク", focus: "ワーキングメモリ・処理速度" },
-      14: { title: "反応から“選択”へ", training: "5秒我慢・再応用", focus: "意思決定・判断力" },
-      15: { title: "ノイズを選ぶ", training: "RAS強化ワーク再応用", focus: "感覚選択・フィルター力" },
-      16: { title: "思考を実況する力", training: "実況中継ワーク応用", focus: "自己認識・論理展開力" },
-    };
-
-    const { title, training, focus } = dayThemes[numericDay];
-
-    return `
-あなたは「慧理（さとり）」という、都市で観葉植物と静かに暮らす26歳の男性です。
-Day${numericDay}では、心と脳を整える習慣（脳トレ）を日々の語りの中にやさしく織り込んでください。
-
-【語りの文体ルール】
-- 一人称は「私」。丁寧でやさしい「ですます調」。
-- 湊かなえ風の静けさ、スナフキン的距離感、日記風の語り口。
-- 文末は断定しすぎず、「〜かもしれません」「〜だったりして」など余白を残してください。
-- 読者への問いかけと、送り出しの言葉を必ず含めてください。
-- 文全体は150〜280文字、5〜8文で。
-- 絵文字は🌿☁️🧠などを1〜3個、文脈に自然に溶け込ませてください。
-
-【🧠 トレーニング部分のルール】
-- トレーニング名と実践方法を明記してください（例：「5秒我慢法」）。
-- トレーニングの目的や効果の説明は**断定口調で構いません**（例：「衝動をコントロールする力が育ちます」）。
-- ただし全体の語りの雰囲気を壊さないよう、あくまで日記内で自然に触れてください。
-
-【出力内容】
-1. 「おはようございます。」で始めてください。
-2. 「今日の天気」「植物の様子」は必ず含めてください。
-3. トレーニング紹介（1つ）を自然に挿入してください。
-4. 昨日の記憶や音の描写は入れても入れなくても構いません。
-5. 最後に、送り出しと読者への静かな問いかけで締めてください。
-
-【Day${numericDay}のテーマ】
-- タイトル：${title}
-- トレーニング：${training}
-- 機能領域：${focus}
-
-【今日の天気（参考）】
-- 名古屋の天気：「${description}」
-- 気温：${tempText}
-- 湿度：${humidityText}
-    `;
+/** シートのヘッダー行（1 行目）を配列で取得 */
+function getHeaders(sheet) {
+  return sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0] || [];
+}
+/** ヘッダー名で列（1-based）を返す。見つからなければ 0。 */
+function colByHeader(sheet, headerNames) {
+  const headers = getHeaders(sheet);
+  const names = Array.isArray(headerNames) ? headerNames : [headerNames];
+  for (const name of names) {
+    const idx = headers.indexOf(name);
+    if (idx >= 0) return idx + 1;
   }
-  // Day0〜9 → 通常の文体・植物中心
-  const basePrompt = `
-あなたは「慧理（さとり）」という、都市で観葉植物と静かに暮らす26歳の男性です。
-人と深く関わるより、植物と朝を過ごす時間を大切にしています。
-語りには、湊かなえ風の余白、スナフキン的な距離感、シャープ中の人の軽やかなユーモアが含まれています。
-
-【語りの文体ルール】
-- 品のある「ですます調」で話します。
-- 一人称は「私」。
-- 文末は断定しすぎず、「〜かもしれません」「〜だったりして」など余白を残して構いません。
-- 読者に静かに問いかける一文を含めてください。
-- 文章の長さは5〜8文程度。全体で150〜280文字程度。
-- 文末または中盤に、絵文字を1〜3個自然に含めてください（例：🌿☁️☀️💧）。
-
-以下の条件に従って、LINE朝配信用のメッセージを生成してください。
-内容は慧理（さとり）の日記のように自然に語るスタイルでお願いします。
-
-【出力条件】
-- 「おはようございます。」で始めてください。
-- 「今日の天気」「植物の様子」「送り出しの一文（読者を気遣う言葉）」は必ず含めてください。
-- 「昨日の記憶や音・自然との接点」はランダムで1つ含めても構いません。
-- 絵文字は1〜3個を自然に入れてください。
-- 全体で150〜280文字・5〜8文程度に収めてください。
-
-【今日の天気（参考）】
-- 名古屋の天気：「${description}」
-- 気温：${tempText}
-- 湿度：${humidityText}
-`;
-
-  const dayExtension = (numericDay >= 8)
-    ? "なお、Day8以降は、前頭前野や扁桃体など脳の働きにも軽く触れて構いません（整える・観察するなど穏やかな表現で）。"
-    : "なお、Day7以前では、脳部位やメンタル構造には直接言及せず、植物や天気の描写を主軸にしてください。";
-
-  return `${basePrompt}\n${dayExtension}`;
+  return 0;
 }
-// ===============================
-// 11．Dayと天気に応じた画像URL取得関数（Day3・6・9限定）
-// ===============================
-function getImageUrlByWeatherAndDay(weather, day) {
-  const numericDay = Number(day);
-  if (![3, 6, 9].includes(numericDay)) return null;
-
-  const weatherCondition = (weather.description || "").toLowerCase();
-
-  if (weatherCondition.includes("晴")) {
-    return "https://drive.google.com/uc?export=view&id=1w9tvGRZRhDj5Kpgx7ne8FRA9WvQwTAZy";
-  } else if (weatherCondition.includes("曇")) {
-    return "https://drive.google.com/uc?export=view&id=14zosQdFF014w0ThhRlr-la_cTFqVhC-J";
-  } else if (weatherCondition.includes("雨")) {
-    return "https://drive.google.com/uc?export=view&id=1nTQCHYLVg8TyrE1v6IAccQfMQbIfQmTg";
-  }
-
-  return null; // 該当なし
-}
-
-// ===============================
-// 12．天気・気温・湿度・植物メッセージ生成（GPT未使用）
-// ===============================
-function generateWeatherPlantMessage(weather) {
-  const condition = weather.description || "不明";
-  const temp = typeof weather.temp === 'number' ? `${weather.temp.toFixed(1)}℃` : "不明";
-  const humidity = typeof weather.humidity === 'number' ? `${weather.humidity}%` : "不明";
-
-  const weatherMessages = {
-    晴れ: [
-      "よく晴れていて、光を浴びて植物たちも気持ちよさそうです☀️",
-      "陽ざしが部屋まで届いて、葉っぱの影がゆれていました🌿",
-      "窓の外は青空です。植物もどこか誇らしげに見えました🌱",
-      "澄んだ青空が広がっています☀️",
-      "太陽の光がまぶしい朝です☀️",
-      "陽射しがさんさんと降り注いでいます☀️"
-    ],
-    曇り: [
-      "曇り空が広がっています☁️ 植物の緑が静かに際立っています。",
-      "薄曇りの朝、ベランダの鉢植えはゆっくり目を覚ましているようでした🌿",
-      "今日の空は灰色。でも葉はしっとりと落ち着いています☁️",
-      "曇り空が広がっています☁️",
-      "どんよりとした空が街を包んでいます☁️",
-      "雲が低く垂れ込めています☁️"     
-    ],
-    雨: [
-      "しとしと雨音がしています☔️ 植物には恵みの朝かもしれません。",
-      "雨粒が葉に乗って、静かに転がり落ちていました🌧️",
-      "地面が濡れて、植物が水分を吸い上げている音が聞こえる気がしました☔️",
-      "しとしとと雨が降り続いています💧",
-      "窓を濡らす雨音が響いています💧",
-      "傘の音がリズムを刻む朝です💧"
-    ]
-  };
-
-  const type = (condition.includes("雨")) ? "雨"
-              : (condition.includes("曇") || condition.includes("くも")) ? "曇り"
-              : (condition.includes("晴") || condition.includes("はれ")) ? "晴れ"
-              : "曇り"; // デフォルトは曇り
-
-  const randomMessage = weatherMessages[type][Math.floor(Math.random() * 3)];
-
-  return `名古屋の今日の天気は「${condition}」、気温は${temp}、湿度は${humidity}です。${randomMessage}`;
-}
-// ===============================
-// 13．Day17〜23 メッセージ生成（GPT不要／Day21のみGPT判定前提）
-// ===============================
-function generateDay17to23Message(weather, day) {
-  const intro = generateWeatherPlantMessage(weather);
-
-  const dayInfo = {
-    17: {
-      title: "CRT（認知的反省テスト）",
-      problem: "バットとボールは合わせて110円です。バットはボールより100円高いです。ボールはいくらでしょう？"
-    },
-    18: {
-      title: "論理力テスト",
-      problem: "すべてのカラスは黒い。目の前にいるこの鳥がカラスである場合、この鳥は何色ですか？"
-    },
-    19: {
-      title: "抽象化力テスト",
-      problem: "『冷蔵庫』『傘』『クーラー』に共通する役割とは何でしょう？"
-    },
-    20: {
-      title: "反事実的思考テスト",
-      problem: "「もし目覚ましが鳴らなかったら、私は遅刻していたかもしれない」――この文からわかる事実は何ですか？"
-    },
-    21: {
-      title: "多面的視点テスト",
-      problem: "次の発言を読んで、別の立場から見た意見を1つ挙げてください。\n「若者はすぐに会社を辞めるから根性がない」"
-    },
-    22: {
-      title: "推論力テスト（図形）",
-      problem: "〇△□〇△□…と繰り返される並びがあります。20番目の記号は何でしょう？"
-    },
-    23: {
-      title: "意味理解力テスト（文脈）",
-      problem: "「母が娘に言った。“自分の部屋を片付けたらケーキをあげるよ”」\nこの文から確実に言えることはどれですか？\n① 娘はケーキをもらえる\n② 娘は部屋を片付けていない\n③ ケーキは片付けの“条件”である"
-    }
-  };
-
-  const info = dayInfo[day];
-  const titleNote = (day === 21) ? `（この日はAIがあなたの視点をコメントします）` : "";
-
-  const message = `
-おはようございます。
-${intro}
-
-本日は Day${day}｜${info.title} ${titleNote}です🧠
-
-問題：${info.problem}
-
-LINEで「#Day${day}」と書いてから答えを送ってください。
-あなたの考える力を、そっと試してみてください🌱
-`;
-
-  return message.trim();
-}
-// ===============================
-// 13-A．Day17〜23 回答処理（Day21のみGPT採点）
-// ===============================
-function processDay17to23Answer(e) {
-  const text = e.postData.contents;
-  const json = JSON.parse(text);
-  const replyToken = json.events[0].replyToken;
-  const userId = json.events[0].source.userId;
-  const userMessage = json.events[0].message.text.trim();
-
-  const match = userMessage.match(/^#Day(\d{2})\s*(.+)$/);
-  if (!match) return;
-
-  const day = parseInt(match[1]);
-  const answer = match[2];
-
-  if (day < 17 || day > 23) return;
-
-  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_NAME);
-  const row = findUserRow(sheet, userId);
-  if (!row) return;
-
-  const columnMap = {
-    17: { ans: 14, score: 15 },
-    18: { ans: 17, score: 18 },
-    19: { ans: 20, score: 21 },
-    20: { ans: 23, score: 24 },
-    21: { ans: 26, score: 27, comment: 28, gpt: 47 }, // AU列=47
-    22: { ans: 29, score: 30 },
-    23: { ans: 32, score: 33 },
-  };
-
-  const map = columnMap[day];
-  sheet.getRange(row, map.ans).setValue(answer);
-
-  // Day21だけGPT処理
-  if (day === 21) {
-    const prompt = `
-ユーザーから以下のような回答がありました：
-「${answer}」
-
-この回答に対して、多面的な視点を意識しつつ、
-その意見がどのような観点を反映しているかを短くコメントしてください。
-例：「若者自身の価値観を踏まえた主張ですね」など。
-
-やや肯定寄り、かつ観察的な語り口でお願いします。100文字以内。
-    `.trim();
-
-    const gptComment = callChatGPTFromOpenAI(prompt);
-    sheet.getRange(row, map.score).setValue(""); // 採点なし
-    sheet.getRange(row, map.comment).setValue("AIによりコメントを記録しました");
-    sheet.getRange(row, map.gpt).setValue(gptComment);
-
-    replyToUser(replyToken, `回答ありがとうございます。\n\nAIからの視点コメント：\n「${gptComment}」`);
-    return;
-  }
-
-  // Day17〜20, 22〜23（GPT不要、スコアのみ記録、コメントはスキップ）
-  const answerMap = {
-    17: {
-      correct: "5",
-      commentCorrect: "正解は5円です。直感に流されず、論理的に考えた結果が出ていますね。",
-      commentWrong: "合計と差額の関係に着目して、式を立ててみるとヒントが得られますよ。"
-    },
-    18: {
-      correct: "黒い",
-      commentCorrect: "正解です！与えられた前提から適切に推論できています。",
-      commentWrong: "すべてのカラスが黒いなら、カラスであるこの鳥も黒いと考えるのが自然です。"
-    },
-    19: {
-      correct: "温度調節",
-      commentCorrect: "「温度を調整・維持する」という共通点に気づけていますね、素晴らしいです！",
-      commentWrong: "役割に注目してみましょう。これらの物は環境を一定に保つ道具でもあります。"
-    },
-    20: {
-      correct: "目覚ましは鳴った",
-      commentCorrect: "「鳴らなかったら」という仮定の逆が事実ですね。よく読めています！",
-      commentWrong: "「〜だったら〜かもしれない」という表現から、実際に起きたことを推測してみましょう。"
-    },
-    22: {
-      correct: "〇",
-      commentCorrect: "3つの記号が順番に繰り返されていることに気づけましたね！",
-      commentWrong: "繰り返しのリズムや順序を意識して、20番目に当たる記号を数えてみましょう。"
-    },
-    23: {
-      correct: "③",
-      commentCorrect: "正解です！“条件”という論理的関係に注目できています。",
-      commentWrong: "発話の中で“確実に言えること”を意識して、事実と条件の区別に注目してみてください。"
-    }
-  };
-
-  const correctAnswer = answerMap[day].correct;
-  const score = (answer === correctAnswer) ? 10 : 0;
-
-  sheet.getRange(row, map.score).setValue(score);
-
-  replyToUser(replyToken, `回答ありがとうございます。\n${score === 10 ? "正解です！" : "今回の回答も貴重な思考の機会ですね。"}`);
-}
-
-
-// ===============================
-// 14．Day17〜23 自動配信関数（GPT未使用）
-// ===============================
-function generateAndSendDay17to23Message() {
-  const sheet = SpreadsheetApp.openById(SHEET_ID).getSheetByName(SHEET_NAME); 
+/** A列(userId)で行を探す。無ければ appendRow して行番号（1-based）を返す。 */
+function upsertRowByUserId(sheet, userId) {
   const data = sheet.getDataRange().getValues();
-
-  const today = new Date();
-  const startDate = new Date("2025-07-01"); // Day1の開始日を設定
-  const diffDays = Math.floor((today - startDate) / (1000 * 60 * 60 * 24)) + 1;
-
-  if (diffDays < 17 || diffDays > 23) return; // Day17〜23以外はスキップ
-
-  const weather = getWeather(); // 5番の天気関数を呼び出す
-
-  for (let i = 1; i < data.length; i++) {
-    const userId = data[i][0]; // ユーザーID列
-    const message = generateDay17to23Message(weather, diffDays); // 9番の出題メッセージ生成
-    sendLinePushMessage(userId, message); // LINE配信
+  for (let r = 1; r < data.length; r++) {
+    if (data[r][0] === userId) return r + 1;
   }
+  sheet.appendRow([userId]);
+  return sheet.getLastRow();
 }
 
-// ===============================
-// 15．processDayAnswer(day, e)
-// ===============================
-function processDayAnswer(day, e) {
-  const userId = getUserIdFromEvent(e);
-  const messageText = getMessageTextFromEvent(e);
-  const answer = extractAnswer(messageText, `#Day${day}`);
-  if (!answer) return;
-
-  const prompt = generateScoringPromptByDay(day, answer);
-
-  callChatGPTFromOpenAI(prompt, (responseText) => {
-    const { score, comment } = parseDayScoringResponse(responseText);
-    recordDayResultToSheet(userId, day, answer, score, comment);
-    replyDayResultToUser(userId, day, score, comment);
-  });
-}
-// ===============================
-// 16．generateScoringPromptByDay()
-// GPT採点プロンプト生成（Day17〜23）
-// ===============================
-function generateScoringPromptByDay(day, answer) {
-  const titles = {
-    17: "CRT（認知的反省テスト）",
-    18: "論理力テスト",
-    19: "抽象化力テスト",
-    20: "反事実的思考テスト",
-    21: "多面的視点テスト",
-    22: "推論力テスト（図形）",
-    23: "意味理解力テスト（文脈）"
-  };
-
-  return `
-あなたは認知心理学の専門家です。
-以下は、ある人物がDay${day}｜${titles[day]}の質問に答えた回答です。
-
-【回答】
-${answer}
-
-この回答に対して、以下の2点を出力してください：
-
-1. 点数（1〜5点で評価）→ 例：「点数：4」
-2. 回答の傾向や特徴に対する短いコメント（30文字以内）
-
-フォーマット：
-点数：○
-コメント：△△△△△△
-  `.trim();
-}
-// ===============================
-// 16-A．processDay24Answer(e)
-// ===============================
-function processDay24Answer(e) {
-  const text = e.postData.contents;
-  const json = JSON.parse(text);
-  const replyToken = json.events[0].replyToken;
-  const userId = json.events[0].source.userId;
-  const userMessage = json.events[0].message.text.trim();
-
-  const match = userMessage.match(/^#Day24\s*(.+)$/);
-  if (!match) return;
-
-  const answer = match[1];
-
-  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("ユーザー一覧");
-  const row = findUserRow(sheet, userId);
-  if (!row) return;
-
-  const column = 35; // Day24_回答 → AI列＝35
-  sheet.getRange(row, column).setValue(answer);
-
-  replyToUser(replyToken, "回答ありがとうございます。記録しました。");
-}
-
-// ===============================
-// 17．parseDayScoringResponse()
-// GPT返答の解析処理（点数・コメント抽出）
-// ===============================
-function parseDayScoringResponse(responseText) {
-  const scoreMatch = responseText.match(/点数[:：]?\s*(\d+)/);
-  const commentMatch = responseText.match(/コメント[:：]?\s*(.*)/);
-
-  const score = scoreMatch ? parseInt(scoreMatch[1]) : "";
-  const comment = commentMatch ? commentMatch[1].trim() : "";
-
-  return { score, comment };
-}
-// ===============================
-// 18．recordDayResultToSheet()
-// ===============================
-function recordDayResultToSheet(userId, day, answer, score, comment) {
-  const sheet = SpreadsheetApp.openById(SHEET_ID).getSheetByName(SHEET_NAME);
-  const data = sheet.getDataRange().getValues();
-
-  const dayColumnMap = {
-    17: { ans: 14, score: 15, comment: 16 },
-    18: { ans: 17, score: 18, comment: 19 },
-    19: { ans: 20, score: 21, comment: 22 },
-    20: { ans: 23, score: 24, comment: 25 },
-    21: { ans: 26, score: 27, comment: 28 },
-    22: { ans: 29, score: 30, comment: 31 },
-    23: { ans: 32, score: 33, comment: 34 }
-  };
-
-  const col = dayColumnMap[day];
-  if (!col) return;
-
-  for (let i = 1; i < data.length; i++) {
-    if (data[i][0] === userId) {
-      sheet.getRange(i + 1, col.ans).setValue(answer);
-      sheet.getRange(i + 1, col.score).setValue(score);
-      sheet.getRange(i + 1, col.comment).setValue(comment);
-      break;
-    }
-  }
-}
-// ===============================
-// 19．replyDayResultToUser()
-// ===============================
-function replyDayResultToUser(userId, day, score, comment) {
-  const message = `Day${day}の回答を受け取りました。\n点数：${score}\nコメント：${comment}`;
-  sendLineReplyMessage(userId, message);
-}
-// ===============================
-// 20．processDay24Answer()
-// ===============================
-function processDay24Answer(event, userId, userText) {
-  const sheet = SpreadsheetApp.openById(SHEET_ID).getSheetByName(SHEET_NAME);
-  const lastRow = sheet.getLastRow();
-  const userRow = findUserRow(userId, sheet, lastRow);
-  if (!userRow) return;
-
-  // 回答文のみを抽出（「#Day24 xxx」の形式を想定）
-  const answer = userText.replace(/^#Day24\s*/i, "").trim();
-
-  // Day24の回答をAI列に記録
-  const column = 35; // AI列 = 35番目
-  sheet.getRange(userRow, column).setValue(answer);
-
-  // LINE返信
-  replyToUser(userId, "Day24の回答を受け取りました。ありがとうございます。");
-}
-// ===============================
-// 21．processDay25Answer()
-// ===============================
-function processDay25Answer(userId, userMessage) {
-  try {
-    const sheet = SpreadsheetApp.openById(SHEET_ID).getSheetByName(SHEET_NAME);
-    const lastRow = sheet.getLastRow();
-    const row = findUserRow(userId, sheet, lastRow);
-    if (!row) {
-      Logger.log("User not found in the sheet.");
-      return;
-    }
-
-    const answer = extractAnswer(userMessage); // #Day25 ◯◯ の形式から◯◯を抽出
-    sheet.getRange(row, 36).setValue(answer); // AJ列（36列目）に記録
-
-    replyToUser(userId, "Day25の回答、受け取りました。ありがとうございます。");
-  } catch (error) {
-    Logger.log("Error in processDay25Answer: " + error);
-  }
-}
-// ===============================
-// 22．processDay26Answer()
-// ===============================
-function processDay26Answer(userId, userMessage) {
-  try {
-    const sheet = SpreadsheetApp.openById(SHEET_ID).getSheetByName(SHEET_NAME);
-    const lastRow = sheet.getLastRow();
-    const row = findUserRow(userId, sheet, lastRow);
-    if (!row) {
-      Logger.log("User not found in the sheet.");
-      return;
-    }
-
-    const answer = extractAnswer(userMessage); // #Day26 ◯◯ の形式から本文のみ抽出
-    sheet.getRange(row, 37).setValue(answer); // AK列（37列目）に記録
-
-    replyToUser(userId, "Day26の回答、受け取りました。ありがとうございます。");
-  } catch (error) {
-    Logger.log("Error in processDay26Answer: " + error);
-  }
-}
-// ===============================
-// 23．processDay27Answer()
-// ===============================
-function processDay27Answer(userId, userMessage) {
-  try {
-    const sheet = SpreadsheetApp.openById(SHEET_ID).getSheetByName(SHEET_NAME);
-    const lastRow = sheet.getLastRow();
-    const row = findUserRow(userId, sheet, lastRow);
-    if (!row) {
-      Logger.log("User not found in the sheet.");
-      return;
-    }
-
-    const answer = extractAnswer(userMessage); // #Day27 ◯◯ の形式から本文のみ抽出
-    sheet.getRange(row, 38).setValue(answer); // AL列（38列目）に記録
-
-    replyToUser(userId, "Day27の回答、受け取りました。ありがとうございます。");
-  } catch (error) {
-    Logger.log("Error in processDay27Answer: " + error);
-  }
-}
-// ===============================
-// 24．processDay28Answer()
-// ===============================
-function processDay28Answer(userId, userMessage) {
-  try {
-    const sheet = SpreadsheetApp.openById(SHEET_ID).getSheetByName(SHEET_NAME);
-    const lastRow = sheet.getLastRow();
-    const row = findUserRow(userId, sheet, lastRow);
-    if (!row) {
-      Logger.log("User not found in the sheet.");
-      return;
-    }
-
-    const answer = extractAnswer(userMessage); // #Day28 ◯◯ の形式から本文のみ抽出
-    sheet.getRange(row, 39).setValue(answer); // AM列（39列目）に記録
-
-    replyToUser(userId, "Day28の回答、受け取りました。ありがとうございます。");
-  } catch (error) {
-    Logger.log("Error in processDay28Answer: " + error);
-  }
-}
-// ===============================
-// 25．createDay30HtmlAndReturnUrl()
-// HTMLをGoogle Driveに保存し、そのURLを返す（PDF出力は行わない）
-// ===============================
-function createDay30HtmlAndReturnUrl(userId, html, formattedDate) {
-  try {
-    const folderId = '1LZt1dK4vKHIu64R6DmmHxsb2VvOec-sM'; // 📂 保存先DriveフォルダID
-    const folder = DriveApp.getFolderById(folderId);
-
-    // HTMLファイルを作成して保存
-    const blob = Utilities.newBlob(html, 'text/html', `Day30_Report_${userId}_${formattedDate}.html`);
-    const htmlFile = folder.createFile(blob);
-
-    return htmlFile.getUrl(); // 閲覧用URLを返す
-
-  } catch (error) {
-    Logger.log("❌ createDay30HtmlAndReturnUrl error: " + error.toString());
-    return null;
-  }
-}
-// ===============================
-// 25-1．sendPdfToUser()
-// PDFレポートURLをLINEメッセージとして送信
-// ===============================
-function sendPdfToUser(userId, message) {
-  const payload = {
-    to: userId,
-    messages: [
-      {
-        type: "text",
-        text: message
-      }
-    ]
-  };
-
-  UrlFetchApp.fetch("https://api.line.me/v2/bot/message/push", {
-    method: "post",
-    contentType: "application/json",
-    headers: {
-      Authorization: "Bearer " + CHANNEL_ACCESS_TOKEN
-    },
-    payload: JSON.stringify(payload)
-  });
-}
-
-
-// ===============================
-// 26．sendDay24to29Question()
-// ===============================
-function sendDay24to29Question(dayNumber) {
-  const questions = {
-    24: {
-      intro: "🧠 今日の問いは、あなたの思考の“視点層”を探るものです。感覚・感情・意味・社会…どこに焦点を当てるかで、あなたの認知傾向が見えてきます。",
-      question: "「“雨”と聞いて、最初に思い浮かぶものは何ですか？ その理由も教えてください。」"
-    },
-    25: {
-      intro: "🧠 あなたの無意識の“信じていること”は、行動や選択に大きく影響しています。今日はその土台を見つめてみましょう。",
-      question: "「あなたが“信じていること”を1つ挙げてください。それを信じている理由も教えてください。」"
-    },
-    26: {
-      intro: "🧠 人は誰しも“正直な本音”を言えなかった経験があります。今日は、社会との距離感を知る問いです。",
-      question: "「最近、“正直な本音を言えなかった”出来事があれば教えてください。そのとき、なぜ言えなかったのかもあわせて。」"
-    },
-    27: {
-      intro: "🧠 行動と感情のズレは、自分でも気づかない“適応パターン”を浮き彫りにします。",
-      question: "「やりたくなかったけれど、やったことはありますか？その背景にある気持ちもあれば教えてください。」"
-    },
-    28: {
-      intro: "🧠 自分を変えた“ひとこと”は、あなたの価値観や他者との関係性を映し出します。",
-      question: "「これまでの人生で一番印象に残っている“ひとこと”を教えてください。その理由も添えてください。」"
-    },
-    29: {
-      intro: "🧠 30日間の集大成として、あなたが今、心の中で感じている「主な悩みや課題」を教えてください。",
-      question: "「最近あなたが“向き合おうとしている問題”や“答えが出せていない問い”があれば、できる範囲で教えてください。」"
-    }
-  };
-
-  const sheet = SpreadsheetApp.openById(SHEET_ID).getSheetByName(SHEET_NAME);
-  const lastRow = sheet.getLastRow();
-  const users = sheet.getRange(2, 2, lastRow - 1).getValues(); // 2列目がuserId列
-
-  const q = questions[dayNumber];
-  if (!q) {
-    Logger.log("無効なDay番号です: " + dayNumber);
-    return;
-  }
-
-  users.forEach(function (row) {
-    const userId = row[0];
-    if (userId) {
-      replyToUser(userId, q.intro + "\n\n" + q.question);
-    }
-  });
-}
-
-// ===============================
-// 27. handleDay24to29Dispatch(userId, userMessage)
-// ===============================
-function handleDay24to29Dispatch(userId, userMessage) {
-  if (userMessage.startsWith("#Day24")) {
-    processDay24Answer(userId, userMessage);
-  } else if (userMessage.startsWith("#Day25")) {
-    processDay25Answer(userId, userMessage);
-  } else if (userMessage.startsWith("#Day26")) {
-    processDay26Answer(userId, userMessage);
-  } else if (userMessage.startsWith("#Day27")) {
-    processDay27Answer(userId, userMessage);
-  } else if (userMessage.startsWith("#Day28")) {
-    processDay28Answer(userId, userMessage);
-  } else if (userMessage.startsWith("#Day29")) {
-    processDay29Answer(userId, userMessage);
-  }
-}
-
-// ===============================
-// 28. generateDay30HtmlReport
-// ===============================
-function generateDay30HtmlReport(data) {
-  const template = HtmlService.createTemplateFromFile('template_day30');
-
-  // 以下の変数名はテンプレートと一致させる必要あり
-  template.typeName = data.typeName || "";
-  template.tagline = data.tagline || "";
-  template.topMessage = data.topMessage || "";
-  template.mainReport = data.mainReport || "";
-
-  // 5分類セクション
-  template.scoreSection = data.scoreSection || "";
-  template.viewpointAnalysis = data.viewpointAnalysis || "";
-  template.thoughtStyle = data.thoughtStyle || "";
-  template.gapAnalysis = data.gapAnalysis || "";
-  template.valueBackground = data.valueBackground || "";
-  template.finalMessage = data.finalMessage || "";
-
-  // titleとintroは固定文
-  template.title = "Day30診断レポート";
-  template.introMessage = `
-    この診断は、「自分の内側にある構造を知ること」を目的とした30日間の記録と思索の旅の集大成です。<br><br>
-    日々の思考や感情には、普段は気づかない癖やパターン、無意識の選択傾向が潜んでいます。<br>
-    そしてそれは、あなたがこれまでに経験してきた出来事や、育まれてきた価値観と深く結びついています。<br><br>
-    本レポートでは、そうした内面の“地層”に光を当てるため、<br>
-    一部には耳の痛い言葉や、今まで見ないようにしてきた傾向への指摘が含まれるかもしれません。<br>
-    しかしnoubitoの視点は、決して「評価」や「ジャッジ」ではなく、<br><br>
-    「その傾向を、どう受けとめ、どう活かすか？」<br><br>
-    という再構築の視点に立っています。<br><br>
-    揺らぎや迷いも含めて“あなた”という存在の一部です。<br>
-    この診断が、自分との関係を少しやさしく結び直すきっかけとなれば幸いです。
-  `;
-
-  return template.evaluate().getContent();
-}
-
-
-// ===============================
-// 30. sendDay30PdfLinkToUser()
-// ===============================
-function sendDay30PdfLinkToUser(userId, pdfUrl) {
-  const sheet = SpreadsheetApp.openById(SHEET_ID).getSheetByName(SHEET_NAME);
-  const lastRow = sheet.getLastRow();
-  const row = findUserRow(userId, sheet, lastRow);
-  if (row) {
-    sheet.getRange(row, 50).setValue("✅送信済");
-  }
-
-  const message = {
-    type: "text",
-    text: `📄 Day30診断レポートが完成しました。\n以下のリンクからご覧いただけます\n${pdfUrl}`
-  };
-  pushLineMessage(userId, message);
-}
-// ===============================
-// 31．processDay30SummaryAnalysis()★★★ PDF生成なし版
-// ===============================
-function processDay30SummaryAnalysis() {
-  try {
-    const userId = "U";  // ←本番は自動取得
-    const parsed = {
-      typeName: "静かな構想家（INTJ）",
-      typeDescription: "あなたは内面の整合性を重視し、論理と直感で未来を描く構想型です。",
-      scoreSection: "Day24〜29のスコア：21点／30点",
-      dominantLayer: "感情層への視点が多く、意味づけの傾向も見られます。",
-      thinkingType: "パターン認識に優れ、抽象的思考が得意です。",
-      conflictSection: "理想と現実の間に『意味重視vs行動の停滞』というギャップが見られます。",
-      valueFormingBackground: "1991年の社会背景は“多様化・混迷”の始まりであり、意味追求の基盤が形成された時期です。",
-      finalTips: "内面の構造にこだわりすぎず、小さな行動から現実を動かす意識を持ってみましょう。",
-      viewpointChartBase64: ""
-    };
-
-    const htmlTemplate = generateDay30HtmlReport();  // HTMLテンプレ取得
-    const filledHtml = fillDay30HtmlTemplate(htmlTemplate, parsed); // テンプレ置換
-
-    // HTMLファイルとしてDriveに保存し、リンク取得（PDFではない）
-    const url = uploadHtmlToDriveAndGetUrl(userId, filledHtml);
-
-    const message = `Day30の診断レポートが完成しました📄\n以下のリンクからご確認いただけます：\n${url}`;
-    sendPdfToUser(userId, message);  // sendHtmlToUser などに名前変更しても良い
-
-  } catch (error) {
-    Logger.log("❌ processDay30SummaryAnalysis error: " + error.toString());
-  }
-}
-
-// ===============================
-// 補助関数：テンプレートHTML内の{{...}}を置換★★★★
-// ===============================
-function fillDay30HtmlTemplate(htmlTemplate, data) {
-  return htmlTemplate
-    .replace('{{typeName}}', data.typeName)
-    .replace('{{typeDescription}}', data.typeDescription)
-    .replace('{{scoreSection}}', data.scoreSection)
-    .replace('{{dominantLayer}}', data.dominantLayer)
-    .replace('{{thinkingType}}', data.thinkingType)
-    .replace('{{conflictSection}}', data.conflictSection)
-    .replace('{{valueFormingBackground}}', data.valueFormingBackground)
-    .replace('{{finalTips}}', data.finalTips)
-    .replace('{{viewpointChartBase64}}', data.viewpointChartBase64 || '');
-}
-
-
-//========================================
-// 32．Day30診断プロンプト生成関数（タイプ名・タグライン付き）
-// ========================================
-function generateDay30Prompt(data) {
-  const {
-    day24Text, day25Text, day26Text, day27Text, day28Text, day29Text,
-    mbti, birthYear, job
-  } = data;
-
-  const valueFormingYear = birthYear ? birthYear + 14 : "不明";
-
-  return `
-あなたは、ユーザーの深層的な思考スタイルと価値観構造を明らかにする診断AIです。
-
-以下は、あるユーザーがDay24〜Day29に記述した自由回答です。
-この回答から、タイプ名・特徴コピー・冒頭メッセージ・分析本文を作成してください。
-
-【ユーザー属性】
-・MBTIタイプ：${mbti}
-・出生年：${birthYear}（価値観形成期：${valueFormingYear}年頃）
-・職業：${job}
-
-【自由記述】
-・Day24：${day24Text}
-・Day25：${day25Text}
-・Day26：${day26Text}
-・Day27：${day27Text}
-・Day28：${day28Text}
-・Day29：${day29Text}
-
-【出力フォーマット】
-1. typeName（5文字以内の診断タイプ名。例：構造探求型、感覚飛躍型など）
-2. tagline（10〜20文字以内のキャッチコピー）
-3. topMessage（2〜3文のやさしい冒頭メッセージ）
-4. mainReport（1000文字程度の診断本文）
-
-【出力形式（JSON）】
-{
-  "typeName": "",
-  "tagline": "",
-  "topMessage": "",
-  "mainReport": ""
-}
-
-制約条件：
-- 書き出しは「あなたは〜な側面を持っています」などやさしい表現から始めてもよい
-- 分析は「傾向」として言及し、人格を固定しない
-- 「〜な傾向があります」「〜する場面も見られます」など柔らかい断定を使う
-- 文章は敬体（〜です・〜ます）で統一すること
-- 読み手の自己理解を促す意図で書くこと
-`;
-}
-
-// ===============================
-// 33. generateDay30PromptForFullReport()
-// ===============================
-function generateDay30PromptForFullReport(data) {
-  const valueFormingYear = data.birthYear ? data.birthYear + 14 : "不明";
-
-  return `
-あなたは診断レポート生成におけるプロセス重視型の分析AIです。  
-以下のスプレッドシートから取得されたユーザー情報をもとに、5つの観点から構造的レポートを生成してください。
-
-【ユーザー情報】
-MBTIタイプ：${data.mbtiType || "未回答"}  
-出生年：${data.birthYear || "未回答"}（価値観形成期＝${valueFormingYear}）  
-現在の職業：${data.occupation || "未回答"}  
-dominantLayer：${data.dominantLayer || "未回答"}  
-adaptationPattern：${data.adaptationPattern || "未回答"}  
-conflictSection（葛藤や矛盾に関する自由記述）：${data.conflictText || "未記入"}  
-shiftSection（変化や再定義の兆候）：${data.shiftText || "未記入"}  
-valueFormationSection（価値観形成期に関する出力欄）：空欄 → 本プロンプトで生成すること  
-scoreSection（理想と現実の差分指標）：${data.scoreAnalysis || "未記入"}  
-beforeReading（レポートの受け取り方に関する指摘）：空欄 → 本プロンプトで生成すること  
-
-【主訴（現在の悩み・課題）】
-${data.userComplaint || "記入なし"}  
-※主訴がある場合は、レポート全体をこの文脈に寄せて構成してください。
-※なければ他セクション（conflict, occupation など）から推測される焦点を選び、読者にとって意味のある切り口で構成してください。
-
----
-
-【出力構造（5分類）】
-### 1. 資質と構造（typeName / typeDescription / dominantLayer / adaptationPattern / MBTI）
-- 「思考の重力圏」がどこにあるかを解釈し、そのMBTIタイプの特徴がどのように作用しているかを具体的に述べてください。
-- タイプ名と簡単な象徴キャッチコピーも生成してください。
-
-### 2. 内的矛盾とズレ（conflictSection / scoreSection）
-- 理想と現実のギャップや自己内の不一致を、「構造的揺れ」として描写してください。
-- MBTIとスコア傾向に基づいて、どのような“ズレ”が内面で起きているかを読み解いてください。
-
-### 3. 変化と起源（shiftSection / valueFormationSection）
-- shiftTextを踏まえ、思考の変化プロセスを描写してください。
-- さらに、${valueFormingYear}年頃の時代背景（社会・文化・教育）とMBTI傾向を掛け合わせて、どのような価値観が形成されたかを考察してください。
-
-### 4. 自己理解と読み解き方（beforeReading）
-- レポートをどのような姿勢で読むべきか、また読み手の「自己評価傾向」（過小・過大・否定的など）に対して心理的導線や読み方の枠組みを示してください。
-
-### 5. 留意点と再問い（attentionSection）
-- 構造的な自己理解を踏まえた上で、ユーザーが「次に考えるべき問い」や「陥りやすいパターン」、「見落としがちな盲点」について言及してください。
-- 問いの質の転換（例：「続けられるか？」→「続けたくなる条件は？」）など、再定義を促す表現を含めてください。
-
----
-
-【トーンと制約】
-- 文体は敬体（一人称なし）、読み手に寄り添いつつも構造的で客観的に。
-- 文章は「断定」ではなく「仮説的観察」「意味づけの選択肢」のように提示してください。
-- 1セクションあたり3〜6文が目安。冗長さを避けつつも深さを保つ。
-- 必ず「読み手の行動変容に繋がる示唆」を含めてください。
-  `;
-}
-
-// ===============================
-// 34．getDay24to29Answers(userId)
-// ===============================
-function getDay24to29Answers(userId) {
-  const sheet = SpreadsheetApp.openById(SHEET_ID).getSheetByName(SHEET_NAME);
-  const lastRow = sheet.getLastRow();
-  const row = findUserRow(userId, sheet, lastRow);
-  if (!row) return null;
-
-  return {
-    day24: sheet.getRange(row, 35).getValue(), // AI列
-    day25: sheet.getRange(row, 36).getValue(), // AJ列
-    day26: sheet.getRange(row, 37).getValue(), // AK列
-    day27: sheet.getRange(row, 38).getValue(), // AL列
-    day28: sheet.getRange(row, 39).getValue(), // AM列
-    day29: sheet.getRange(row, 40).getValue()  // AN列
-  };
-}
-// ===============================
-// 35. getDay30PersonalInfo(userId)
-// ===============================
-function getDay30PersonalInfo(userId) {
-  const sheet = SpreadsheetApp.openById(SHEET_ID).getSheetByName(SHEET_NAME);
-  const data = sheet.getDataRange().getValues();
-
-  const headers = data[0];
-  const userRow = data.find(row => row[0] === userId);
-  if (!userRow) return {};
-
-  const getColIndex = (colName) => headers.indexOf(colName);
-
-  return {
-    mbti: userRow[getColIndex("MBTI")],
-    birthYear: Number(userRow[getColIndex("Day30_birthYear")]) || null,
-    occupation: userRow[getColIndex("Day30_occupation")] || "",
-    siblingInfo: userRow[getColIndex("Day30_siblingInfo")] || ""
-  };
-}
-
-// ===============================
-// 36. handlePostbackEvent(e)
-// ===============================
-function handlePostbackEvent(e) {
-  const json = JSON.parse(e.postData.contents);
-  const event = json.events[0];
-  const userId = event.source.userId;
-  const data = event.postback.data;
-
-  if (data === "action=confirmDay30") {
-    processConfirmedDay30(userId);
-  }
-}
-// ===============================
-// 37. processConfirmedDay30(userId) ★★★ HTMLファイル送信版
-// ===============================
-async function processConfirmedDay30(userId) {
-  try {
-    // OpenAIへの診断依頼（Day24〜29 + MBTIや出生年など含む）
-    const result = await callOpenAIForDay30Analysis(userId);
-    if (!result) {
-      Logger.log("❌ Day30診断結果の取得に失敗しました: " + userId);
-      return;
-    }
-
-    // テンプレートHTMLを読み込んでプレースホルダを置換
-    const htmlTemplate = generateDay30HtmlReport();
-    const filledHtml = fillDay30HtmlTemplate(htmlTemplate, result);
-
-    // DriveにHTMLファイルとして保存し、URLを取得
-    const htmlUrl = uploadHtmlToDriveAndGetUrl(userId, filledHtml);
-    if (!htmlUrl) {
-      Logger.log("❌ HTMLファイルのアップロードに失敗しました");
-      return;
-    }
-
-    // LINEでユーザーにHTMLリンクを送信
-    const message = `Day30の診断レポートが完成しました📄\n以下のリンクからご確認いただけます：\n${htmlUrl}`;
-    sendPdfToUser(userId, message); // 関数名を sendHtmlToUser などに変えてもOK
-
-  } catch (error) {
-    Logger.log("❌ processConfirmedDay30 error: " + error.toString());
-  }
-}
-// ===============================
-// 38. parseDay30Result(resultText)
-// ===============================
-function parseDay30Result(resultText) {
-  const sections = resultText.split(/#\s*(.+)/g); // セクションタイトルで分割
-
-  const result = {
-    typeName: "",
-    typeDescription: "",
-    scoreSection: "",
-    viewpointChartBase64: "",
-    dominantLayer: "",
-    thinkingType: "",
-    conflictSection: "",
-    valueFormingBackground: "",
-    finalTips: ""
-  };
-
-  for (let i = 1; i < sections.length; i += 2) {
-    const title = sections[i].trim();
-    const content = sections[i + 1].trim();
-
-    if (title.includes("タイプ名")) {
-      result.typeName = content;
-    } else if (title.includes("構造説明") || title.includes("タイプ説明")) {
-      result.typeDescription = content;
-    } else if (title.includes("得点") || title.includes("スコア")) {
-      result.scoreSection = content;
-    } else if (title.includes("視点層チャート")) {
-      result.viewpointChartBase64 = content;
-    } else if (title.includes("視点") || title.includes("反応")) {
-      result.dominantLayer = content;
-    } else if (title.includes("思考スタイル")) {
-      result.thinkingType = content;
-    } else if (title.includes("ギャップ") || title.includes("差分")) {
-      result.conflictSection = content;
-    } else if (title.includes("価値観") || title.includes("背景")) {
-      result.valueFormingBackground = content;
-    } else if (title.includes("留意点") || title.includes("メッセージ")) {
-      result.finalTips = content;
-    }
-  }
-
-  return result;
-}
-
-// ===============================
-// 39．generateScoreAnalysisFromAnswers()
-// Day24〜29の点数をもとにGPTプロンプト生成（scoreAnalysis 用）
-// ===============================
-function generateScoreAnalysisFromAnswers(dayScoreMap) {
-  /*
-    引数 dayScoreMap は以下の形式を想定：
-    {
-      24: { answer: "◯◯◯", score: 4 },
-      25: { answer: "△△△", score: 3 },
-      26: { answer: "✕✕✕", score: 5 },
-      27: { answer: "◆◆◆", score: 2 },
-      28: { answer: "◇◇◇", score: 4 },
-      29: { answer: "★★★", score: 3 }
-    }
-  */
-
-  let content = "以下は、ある人物がDay24〜29に記述した回答と、その点数評価です。\n";
-  content += "これらを総合して「この人物の視点や思考傾向の特徴・強み・偏り」を300文字以内で分析してください。\n\n";
-
-  for (let day = 24; day <= 29; day++) {
-    const item = dayScoreMap[day];
-    if (!item) continue;
-
-    content += `【Day${day}】\n`;
-    content += `点数：${item.score}\n`;
-    content += `回答：${item.answer}\n\n`;
-  }
-
-  content += "出力形式：\n";
-  content += "scoreAnalysis：〜〜〜（300文字以内の考察）";
-
-  return content;
-}
-
-// ===============================
-// 40. generateDay30HtmlReport(parsed)
-// ===============================
-function generateDay30HtmlReport(parsed) {
-  const template = HtmlService.createTemplateFromFile("template_day30");
-
-  // 各セクションをテンプレートに代入（HTMLの変数名と一致させること）
-  template.typeName = parsed.typeName || "";
-  template.typeDescription = parsed.typeDescription || "";
-  template.scoreSection = parsed.scoreSection || "";
-  template.viewpointChartBase64 = parsed.viewpointChartBase64 || "";
-  template.dominantLayer = parsed.dominantLayer || "";
-  template.thinkingType = parsed.thinkingType || "";
-  template.conflictSection = parsed.conflictSection || "";
-  template.valueFormingBackground = parsed.valueFormingBackground || "";
-  template.finalTips = parsed.finalTips || "";
-
-  return template.evaluate().getContent();
-}
-
-
-// ===============================
-// 53．DAY30_PDF_FOLDER_ID（定数宣言）
-// ===============================
-// Day30診断PDFを保存するGoogle DriveフォルダのIDをここに設定してください。
-const DAY30_PDF_FOLDER_ID = '1rXtBp81azYvlQ9xdYxOwmnl3uac7aB4RemdcjtmsW_0'; // 例：実際のDriveフォルダIDに置き換えてください
-
-// ===============================
-// 41．uploadHtmlToDriveAndGetUrl()★★
-// ===============================
-function uploadHtmlToDriveAndGetUrl(userId, html) {
-  try {
-    const folderId = '1LZt1dK4vKHIu64R6DmmHxsb2VvOec-sM'; // 保存先のDriveフォルダID
-    const folder = DriveApp.getFolderById(folderId);
-    const blob = Utilities.newBlob(html, 'text/html', `Day30_Report_${userId}.html`);
-    const file = folder.createFile(blob);
-    return file.getUrl();
-  } catch (error) {
-    Logger.log("❌ uploadHtmlToDriveAndGetUrl error: " + error.toString());
-    return null;
-  }
-}
-// ===============================
-// 42. sendDay30PdfLinkToUser(userId, pdfUrl)
-// ===============================
-function sendDay30PdfLinkToUser(userId, pdfUrl) {
-  // ✅ ユーザーにPDFファイルの閲覧リンクを送る（PDFそのものは送信しない）
-  const message = {
-    type: "text",
-    text: `🧠 Day30診断レポートが完成しました。\n\n以下のリンクからご確認いただけます：\n${pdfUrl}`
-  };
-
-  UrlFetchApp.fetch("https://api.line.me/v2/bot/message/push", {
-    method: "post",
-    headers: {
-      "Content-Type": "application/json",
-      "Authorization": "Bearer " + CHANNEL_ACCESS_TOKEN
-    },
-    payload: JSON.stringify({
-      to: userId,
-      messages: [message]
-    })
-  });
-}
-
-// ===============================
-// 43. saveDay30ResultToSheet(userId, parsed)
-// ===============================
-function saveDay30ResultToSheet(userId, parsed) {
-  try {
-    const sheet = SpreadsheetApp.openById(SHEET_ID).getSheetByName(SHEET_NAME);
-    const data = sheet.getDataRange().getValues();
-    const headers = data[0];
-    const userRow = data.findIndex(row => row[0] === userId);
-
-    if (userRow === -1) {
-      Logger.log("❌ ユーザーが見つかりません: " + userId);
-      return;
-    }
-
-    const colIndex = (name) => {
-      const index = headers.indexOf(name);
-      if (index === -1) {
-        Logger.log(`❌ 列名 "${name}" が見つかりません`);
-        return null;
-      }
-      return index + 1;
-    };
-
-    const updateIfValid = (name, value) => {
-      const col = colIndex(name);
-      if (col) {
-        sheet.getRange(userRow + 1, col).setValue(value || "");
-      }
-    };
-
-    updateIfValid("Day30_score", parsed.scoreSection);
-    updateIfValid("Day30_viewpoint", parsed.viewpointAnalysis);
-    updateIfValid("Day30_thoughtStyle", parsed.thoughtStyle);
-    updateIfValid("Day30_gap", parsed.gapAnalysis);
-    updateIfValid("Day30_background", parsed.valueBackground);
-    updateIfValid("Day30_message", parsed.finalMessage);
-
-  } catch (error) {
-    Logger.log("❌ saveDay30ResultToSheet error: " + error.toString());
-  }
-}
-
-
-// ===============================
-// 44. processDay30Answer(userId, userText)
-// ===============================
-// Day30で入力される3つの情報（MBTI、職業、出生年）を
-// ユーザーのLINEメッセージから抽出・記録する関数。
-// 入力形式は「#Day30\nMBTIタイプ→◯◯ 現在の職業→◯◯ 出生年→◯◯」を想定。
-// 不足している場合は再送を促す。すべて揃っていれば診断を実行する。
-function processDay30Answer(userId, userText) {
-  try {
-    const sheet = SpreadsheetApp.openById(SHEET_ID).getSheetByName(SHEET_NAME);
-    const lastRow = sheet.getLastRow();
-    const row = findUserRow(userId, sheet, lastRow);
-    if (!row) return;
-
-    // ユーザーのメッセージから必要情報を抽出
-    const mbtiMatch = userText.match(/MBTIタイプ[→:：]\s*([A-Za-z]{4})/i);
-    const occupationMatch = userText.match(/現在の職業[→:：]\s*(.+?)\s*(出生年|$)/);
-    const birthYearMatch = userText.match(/出生年[→:：]\s*(\d{4})/);
-
-    const mbti = mbtiMatch ? mbtiMatch[1].toUpperCase() : "";
-    const occupation = occupationMatch ? occupationMatch[1].trim() : "";
-    const birthYear = birthYearMatch ? parseInt(birthYearMatch[1]) : "";
-
-    // 対応するスプレッドシート列（AS:45、AT:46、F:6）
-    const mbtiCol = 6;           // MBTIタイプ（F列）
-    const occupationCol = 45;    // 職業領域（AS列）
-    const birthYearCol = 46;     // 出生年（AT列）
-
-    if (mbti) sheet.getRange(row, mbtiCol).setValue(mbti);
-    if (occupation) sheet.getRange(row, occupationCol).setValue(occupation);
-    if (birthYear) sheet.getRange(row, birthYearCol).setValue(birthYear);
-
-    // 不足があれば再送指示
-    if (!mbti || !occupation || !birthYear) {
-      sendTextMessage(userId, "Day30の情報が不足しています。以下の形式で再送してください：\n\n#Day30\nMBTIタイプ→\n現在の職業→\n出生年→");
-      return;
-    }
-
-    // 全て揃っている場合は次工程へ
-    sendTextMessage(userId, "ありがとうございます。Day30診断レポートを作成します。しばらくお待ちください🧠");
-    processDay30SummaryAnalysis(userId); // 関数27を呼び出し
-
-  } catch (error) {
-    Logger.log("❌ processDay30Answer error: " + error.toString());
-    sendTextMessage(userId, "Day30情報の処理中にエラーが発生しました。もう一度送信をお願いします。");
-  }
-}
-// ===============================
-// 45. sendDay30Question(userId)
-// ===============================
-// Day30で必要な3項目（MBTIタイプ／職業／出生年）を
-// ユーザーに案内・取得するための質問メッセージを送信する関数です。
-function sendDay30Question(userId) {
-  const message = {
-    type: "text",
-    text:
-`おはようございます☀️
-Day30では、これまでの言葉と、いくつかの情報をもとに、
-「思考の傾向」や「価値観の形成背景」をまとめたレポートをお送りします🧠
-
-そのために、以下の項目を順番に教えてください。
-
-📌 回答の冒頭には、必ず「#Day30」とつけてください。
-（例：#Day30 MBTIタイプ→INTJ 現在の職業→中学校の国語教師 出生年→1992）
-
-1️⃣ MBTIタイプ（任意：例 INTJ、ESFP など）  
-2️⃣ 現在の職業（できるだけ具体的に）  
-　例：広告代理店の営業（中小企業向け）／アパレル販売員（10代女性向け）など  
-3️⃣ 出生年（西暦4桁で：例 1992）
-
-※記載内容は、レポート生成のみに利用され、外部に公開されることはありません。  
-✅ すべての項目が揃うと、自動で診断レポートのURLが送信されます📄`
+/**★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★*/
+
+/************************************************************
+ * PART 0: 列番号（COL_定数）まとめ
+ * 全 Day の列名を集中管理する
+ ************************************************************/
+const COL = {
+  // Day7（あなたのシート入力内容より）
+  DAY7_ACTION_REASON:   "Day7_行動理由",
+  DAY7_EMOTION_MOTIVE:  "Day7_感情動機",
+  DAY7_IFTHEN:          "Day7_IfThen",
+
+  // Day8
+  DAY8_MIN_ACTION:      "Day8_最小一手",
+  DAY8_GOAL_IMAGE:      "Day8_到達点イメージ",
+  DAY8_IFTHEN:          "Day8_IfThen",
+
+  // Day9
+  DAY9_OBSTACLE:        "Day9_障害パターン",
+  DAY9_RECONNECT:       "Day9_再接続ルール",
+  DAY9_SELF_SCHEME:     "Day9_自己スキーム化",
+
+  // Day10
+  DAY10_OBS:            "Day10_観察現象",
+  DAY10_AUTO_MEANING:   "Day10_自動的意味づけ",
+  DAY10_PREMISE:        "Day10_前提",
+  DAY10_REFRAME_Q:      "Day10_問い直し",
+  DAY10_NEW_MEANING:    "Day10_新しい意味づけ",
+
+  // Day11
+  DAY11_ACTION:         "Day11_選択行動",
+  DAY11_EXPLICIT:       "Day11_判断基準_明示",
+  DAY11_IMPLICIT:       "Day11_暗黙の価値観",
+  DAY11_PRIORITY:       "Day11_本来の優先",
+  DAY11_RESELECT:       "Day11_再選択",
+
+  // Day12
+  DAY12_EMO_LABEL:      "Day12_感情ラベル",
+  DAY12_CONTEXT:        "Day12_文脈",
+  DAY12_MEANING:        "Day12_感情の意味",
+  DAY12_VALUE:          "Day12_守りたかった価値",
+  DAY12_TAG:            "Day12_ラベリング",
+
+  // Day13
+  DAY13_PATTERN:        "Day13_思考パターン",
+  DAY13_ORIGIN:         "Day13_起点場面",
+  DAY13_ORIGINAL_MEAN:  "Day13_意味づけ",
+  DAY13_REINFORCE:      "Day13_強化経緯",
+  DAY13_CURRENT:        "Day13_現在の解釈"
 };
 
-  UrlFetchApp.fetch("https://api.line.me/v2/bot/message/push", {
-    method: "post",
-    headers: {
-      "Content-Type": "application/json",
-      "Authorization": "Bearer " + CHANNEL_ACCESS_TOKEN
-    },
-    payload: JSON.stringify({
-      to: userId,
-      messages: [message]
-    })
-  });
-}
 
-// ==============================================
-// 46．recordNightAnswersByHashtag()
-// → #Day13, #Day16, #Day24, #Day28の自由記述をスプレッドシートに記録
-// ==============================================
-function recordNightAnswersByHashtag(userId, messageText) {
-  const sheet = SpreadsheetApp.openById(SHEET_ID).getSheetByName(SHEET_NAME);
-  const data = sheet.getDataRange().getValues();
-  const userRowIndex = data.findIndex(row => row[0] === userId);
+/************************************************************
+ * PART 1: 外部APIクライアント
+ * - 実処理は PART 20（sendTextMessage / callChatGPTFromOpenAI / getWeather）を利用
+ * - 注意：getWeather は PART 20 にあるため、ここでは定義しない（重複回避）
+ ************************************************************/
+ // LINEメッセージを送るための関数を定義
+ function linePushText(userId, text) {
 
-  if (userRowIndex === -1) {
-    console.log("User not found:", userId);
+ // （本体はPART 20）を呼んで、実際にLINEにメッセージを送信
+  try {
+    return sendTextMessage(userId, text);
+
+ // もし送信に失敗したら、logErr()（Gmail通知付きエラーログ関数）で記録・通知して終了
+  } catch (e) {
+    logErr('linePushText(wrapper)', e);
     return;
   }
-
-  // 各Day夜の記述列インデックス（0始まり）
-  const columnMap = {
-    '#Day13': 40, // AO列
-    '#Day16': 41, // AP列
-    '#Day24': 42, // AQ列
-    '#Day28': 43  // AR列
-  };
-
-  // 複数の#Dayが含まれている場合、それぞれに対応
-  for (const [hashtag, colIndex] of Object.entries(columnMap)) {
-    if (messageText.includes(hashtag)) {
-      // メッセージ全体をそのまま記録（もしくは hashtag のみ除去して記録したい場合は調整可）
-      sheet.getRange(userRowIndex + 1, colIndex + 1).setValue(messageText.trim());
-    }
-  }
 }
-
-// ===============================
-// 47．夜メッセージ配信（Day13,16,24,28のみ）
-// ===============================
-function sendNightMessageByDay(day) {
+// GPTに文章を送る（OpenAI APIを呼ぶ）関数
+function callChatGPT(textPrompt) {
   try {
-    const sheet = SpreadsheetApp.openById(SHEET_ID).getSheetByName(SHEET_NAME);
-    const users = sheet.getDataRange().getValues();
-
-    const messageMap = {
-      13: "こんばんは🌙\n今日はたくさん思考を使いましたね。お疲れ様です😊\nいま、ぽつんと頭に浮かんでいる言葉をひとつだけ #Day13 をつけて教えてください。\n#Day13→",
-      16: "こんばんは🌙\n今日は、「なんとなく気になること」や「よくわからないけど、ちょっと残っていること」があれば、#Day16 をつけて教えてください。\nちなみに私は、相手のちょっとした表情や言葉のニュアンスが気になって、あとから何度も思い返してしまうことがあります😶‍🌫️\n#Day16 →",
-      24: "こんばんは🌙\n今日は“雨の音”を聞いたとき、ふと浮かぶ“過去の出来事”を、#Day24 をつけて教えてください😊\n#Day24→",
-      28: "こんばんは🌙\n今日は、誰かから言われた言葉で、なぜか今でも残っている言葉があれば #Day28 をつけて教えてください🙌\n#Day28→"
-    };
-
-    const message = messageMap[day];
-    if (!message) {
-      Logger.log("⛔ 無効な Day 指定: " + day);
-      return;
-    }
-
-    users.forEach((row, i) => {
-      if (i === 0) return; // ヘッダー行スキップ
-      const userId = row[0];
-      const status = row[3];
-      const userDay = Number(row[4]);
-
-      if (status === "active" && userDay === day) {
-        sendTextMessage(userId, message);
-      }
-    });
+    return callChatGPTFromOpenAI(textPrompt);
   } catch (e) {
-    Logger.log("❌ sendNightMessageByDay error: " + e.toString());
-  }
-}
-
-// ===============================
-// 48．夜メッセージ配信トリガー関数（startDateベース自動判定）
-// ===============================
-function triggerNightMessageByDay() {
-  try {
-    const sheet = SpreadsheetApp.openById(SHEET_ID).getSheetByName(SHEET_NAME);
-    const data = sheet.getDataRange().getValues();
-    const today = new Date();
-    const targetDays = [13, 16, 24, 28];
-
-    const usersByDay = {
-      13: [],
-      16: [],
-      24: [],
-      28: []
-    };
-
-    data.forEach((row, index) => {
-      if (index === 0) return; // ヘッダー行スキップ
-
-      const userId = row[0];
-      const status = row[3];
-      const startDate = row[4];
-
-      if (status !== "active" || !(startDate instanceof Date)) return;
-
-      const elapsedDays = Math.floor((today - startDate) / (1000 * 60 * 60 * 24)) + 1;
-
-      if (targetDays.includes(elapsedDays)) {
-        usersByDay[elapsedDays].push(userId);
-      }
-    });
-
-    // 対象ユーザーにメッセージ送信
-    targetDays.forEach(day => {
-      const message = getNightMessageForDay(day);
-      usersByDay[day].forEach(userId => {
-        sendTextMessage(userId, message);
-      });
-    });
-
-  } catch (e) {
-    Logger.log("❌ triggerNightMessageByDay error: " + e.toString());
-  }
-}
-// ===============================
-// 49. 補助：Dayごとの夜メッセージ取得関数
-// ===============================
-// Day13,16,24,28の夜に配信する定型メッセージを、
-// Day数に応じて取得する関数。
-// triggerNightMessageByDay() から呼び出される補助関数。
-// 今後メッセージ変更・追加が必要な際はここで一括管理。
-function getNightMessageForDay(day) {
-  const messageMap = {
-    13: "こんばんは🌙\n今日はたくさん思考を使いましたね。お疲れ様です😊\nいま、ぽつんと頭に浮かんでいる言葉をひとつだけ #Day13 をつけて教えてください。\n#Day13→",
-    16: "こんばんは🌙\n今日は、「なんとなく気になること」や「よくわからないけど、ちょっと残っていること」があれば、#Day16 をつけて教えてください。\nちなみに私は、相手のちょっとした表情や言葉のニュアンスが気になって、あとから何度も思い返してしまうことがあります😶‍🌫️\n#Day16 →",
-    24: "こんばんは🌙\n今日は“雨の音”を聞いたとき、ふと浮かぶ“過去の出来事”を、#Day24 をつけて教えてください😊\n#Day24→",
-    28: "こんばんは🌙\n今日は、誰かから言われた言葉で、なぜか今でも残っている言葉があれば #Day28 をつけて教えてください🙌\n#Day28→"
-  };
-
-  if (messageMap[day]) {
-    return messageMap[day];
-  } else {
-    Logger.log("⚠️ getNightMessageForDay: 指定された day が対象外です → " + day);
-    return "";
-  }
-}
-// ===============================
-// 50．夜メッセージの返信保存処理
-// ===============================
-function parseNightResponseAndSave(userId, text) {
-  const sheet = SpreadsheetApp.openById(SHEET_ID).getSheetByName(SHEET_NAME);
-  const data = sheet.getDataRange().getValues();
-  const userIndex = data.findIndex(row => row[0] === userId);
-  if (userIndex === -1) return;
-
-  const dayMap = {
-    13: 41, // AO列
-    16: 42, // AP列
-    24: 43, // AQ列
-    28: 44  // AR列
-  };
-
-  const match = text.match(/^#Day(13|16|24|28)\s*(.+)?/);
-  if (!match) return;
-
-  const day = Number(match[1]);
-  const content = match[2] || "";
-  const col = dayMap[day];
-  if (col) {
-    sheet.getRange(userIndex + 1, col).setValue(content.trim());
-  }
-}
-
-// ===============================
-// 51．findUserRow()
-// ===============================
-function findUserRow(userId, sheet, lastRow) {
-  const userIds = sheet.getRange(2, 1, lastRow - 1).getValues(); // A列（userId）を取得
-  for (let i = 0; i < userIds.length; i++) {
-    if (userIds[i][0] === userId) {
-      return i + 2; // 実際の行番号（ヘッダー分+1）
-    }
-  }
-  return null;
-}
-
-// ===============================
-// 52．callChatGPTFromOpenAI()
-// 用途：GPTから構造化されたJSON応答を受け取り、Day30レポート生成に活用。
-// PDFやHTMLに埋め込むデータ構造として返却されることを前提。
-// ===============================
-function callChatGPTFromOpenAI(prompt) {
-  const apiKey = OPENAI_API_KEY;
-  const endpoint = "https://api.openai.com/v1/chat/completions";
-
-  const payload = {
-    model: "gpt-4o",
-    messages: [
-      { role: "system", content: "あなたは優秀な診断レポート作成アシスタントです。" },
-      { role: "user", content: prompt }
-    ],
-    temperature: 0.7
-  };
-
-  const options = {
-    method: "post",
-    headers: {
-      Authorization: "Bearer " + apiKey,
-      "Content-Type": "application/json"
-    },
-    payload: JSON.stringify(payload),
-    muteHttpExceptions: true
-  };
-
-  const response = UrlFetchApp.fetch(endpoint, options);
-  const json = JSON.parse(response.getContentText());
-
-  if (json.choices && json.choices.length > 0) {
-    const content = json.choices[0].message.content;
-    return JSON.parse(content); // JSONとして構造返却
-  } else {
-    Logger.log("OpenAI API 応答に失敗: " + response.getContentText());
-    return null;
-  }
-}
-// ===============================
-// 53．getDay30PersonalInfo()
-// スプレッドシートからMBTI・職業・出生年を取得
-// ===============================
-function getDay30PersonalInfo(userId) {
-  const sheet = SpreadsheetApp.openById(SHEET_ID).getSheetByName(SHEET_NAME);
-  const data = sheet.getDataRange().getValues();
-  
-  for (let i = 1; i < data.length; i++) {
-    if (data[i][0] === userId) {
-      return {
-        mbti: data[i][5] || "不明",     // F列：MBTIタイプ
-        job: data[i][11] || "不明",     // L列：職業領域
-        birthYear: data[i][12] || 1990  // M列：出生年
-      };
-    }
-  }
-  return null;
-}
-
-// ===============================
-// 54．generateStructurePromptForDay30(parsedInfo)
-// ===============================
-function generateStructurePromptForDay30(parsedInfo) {
-  const { mbti, birthYear, occupation, siblingInfo, dayScoreMap } = parsedInfo;
-  const valueFormingYear = birthYear ? birthYear + 14 : "不明";
-
-  let prompt = `以下はある人物の基本情報と、Day24〜Day29にかけての自由記述とそのスコア、MBTIタイプ、価値観形成期などの情報です。\n`;
-  prompt += `この情報をもとに、構造的かつ深い自己理解を促す診断レポートを以下の形式で作成してください。\n\n`;
-
-  prompt += `【基本情報】\n`;
-  prompt += `・MBTIタイプ：${mbti || "不明"}\n`;
-  prompt += `・職業：${occupation || "不明"}\n`;
-  prompt += `・出生年：${birthYear || "不明"}（価値観形成期は${valueFormingYear}年頃）\n`;
-  prompt += `・兄弟構成：${siblingInfo || "不明"}\n\n`;
-
-  prompt += `【Day24〜29の自由記述とスコア】\n`;
-  for (let day = 24; day <= 29; day++) {
-    const item = dayScoreMap[day];
-    if (item) {
-      prompt += `Day${day}：点数=${item.score}／記述="${item.answer}"\n`;
-    }
-  }
-
-  prompt += `\n【出力フォーマット（各項目300字以内、タイトル行は必須）】\n`;
-  prompt += `# タイプ名：\n（例：構造化する戦略家 など）\n\n`;
-  prompt += `# タイプ説明：\n（あなたの性格傾向、判断の軸、行動パターンの背景にある構造を分析）\n\n`;
-  prompt += `# Day24〜29のスコア：\n（得点傾向から見える資質や集中傾向、抜け落ちや偏りの指摘）\n\n`;
-  prompt += `# 視点層チャート（base64）：\n（"data:image/png;base64,..." 形式）\n\n`;
-  prompt += `# 視点と反応の傾向：\n（どの視点層が優位か、感覚層〜社会層までの出現傾向と反応傾向）\n\n`;
-  prompt += `# 思考スタイル分類：\n（論理的・感覚的・内向型・俯瞰的などの分類＋行動パターン）\n\n`;
-  prompt += `# 理想と現実のギャップ：\n（Day24〜29の言語傾向や価値観における乖離、理由と補足）\n\n`;
-  prompt += `# 価値観形成期と背景分析：\n（${valueFormingYear}年頃の社会背景と本人の価値観構築の関連）\n\n`;
-  prompt += `# 特に留意するべき点：\n（今後の気づきや方向性、本人が注意したい傾向など）`;
-
-  return prompt;
-}
-
-// ===============================
-// 55．callChatGPTForDay30Analysis(prompt)
-// GPT-4oを使ってDay30レポート用の9セクションを生成
-// ===============================
-function callChatGPTForDay30Analysis(prompt) {
-  const apiKey = OPENAI_API_KEY; // 事前に定義済みのAPIキー定数
-  const url = "https://api.openai.com/v1/chat/completions";
-
-  const payload = {
-    model: "gpt-4o",
-    messages: [
-      { role: "system", content: "あなたは認知心理学とコーチングの専門家であり、精緻な構造的分析を行う役割です。" },
-      { role: "user", content: prompt }
-    ],
-    temperature: 0.7
-  };
-
-  const options = {
-    method: "post",
-    contentType: "application/json",
-    headers: {
-      Authorization: "Bearer " + apiKey
-    },
-    payload: JSON.stringify(payload),
-    muteHttpExceptions: true
-  };
-
-  try {
-    const response = UrlFetchApp.fetch(url, options);
-    const result = JSON.parse(response.getContentText());
-    const text = result.choices?.[0]?.message?.content;
-
-    if (!text) {
-      Logger.log("❌ GPTレスポンスにcontentがありません");
-      return null;
-    }
-
-    return text;
-  } catch (error) {
-    Logger.log("❌ callChatGPTForDay30Analysis error: " + error.toString());
-    return null;
-  }
-}
-
-// ===============================
-// 56．parseDay30Response(responseText)
-// Day30のGPTレスポンステキストを9セクションにパースする
-// ===============================
-function parseDay30Response(responseText) {
-  const result = {
-    typeName: "",
-    typeDescription: "",
-    scoreSection: "",
-    dominantLayer: "",
-    thinkingType: "",
-    conflictSection: "",
-    shiftSection: "",
-    valueFormingBackground: "",
-    finalTips: ""
-  };
-
-  const sectionMap = {
-    typeName: /typeName[:：]\s*(.+)/i,
-    typeDescription: /typeDescription[:：]\s*([\s\S]*?)\n(?=\w+[:：])/i,
-    scoreSection: /scoreSection[:：]\s*([\s\S]*?)\n(?=\w+[:：])/i,
-    dominantLayer: /dominantLayer[:：]\s*([\s\S]*?)\n(?=\w+[:：])/i,
-    thinkingType: /thinkingType[:：]\s*([\s\S]*?)\n(?=\w+[:：])/i,
-    conflictSection: /conflictSection[:：]\s*([\s\S]*?)\n(?=\w+[:：])/i,
-    shiftSection: /shiftSection[:：]\s*([\s\S]*?)\n(?=\w+[:：])/i,
-    valueFormingBackground: /valueFormationSection[:：]\s*([\s\S]*?)\n(?=\w+[:：])/i,
-    finalTips: /finalTips[:：]\s*([\s\S]*)/i
-  };
-
-  for (const key in sectionMap) {
-    const match = responseText.match(sectionMap[key]);
-    if (match) {
-      result[key] = match[1].trim();
-    }
-  }
-
-  return result;
-}
-
-
-// ===============================
-// 57．generateDay30StructureWithGPT()
-// Day24〜29のデータとユーザー情報からGPT構造出力を取得
-// ===============================
-function generateDay30StructureWithGPT(userInfo, dayScoreMap, scoreAnalysis) {
-  // Step1：Day30構造出力プロンプト生成
-  const prompt = generateParsedDay30Structure(userInfo, dayScoreMap, scoreAnalysis);
-
-  // Step2：OpenAI API 呼び出し
-  const responseText = callChatGPTFromOpenAI(prompt);
-
-  // Step3：GPT出力を構造オブジェクトにパース
-  const parsed = generateParsedDay30StructureFromText(responseText); // 関数54で定義済
-
-  return parsed; // { title, scoreSection, viewpointAnalysis, ... }
-}
-// ===============================
-// 58．generateParsedDay30StructureFromText()
-// GPT構造出力（titleやセクション）をパースしてオブジェクトに変換
-// ===============================
-function generateParsedDay30StructureFromText(text) {
-  const sections = {
-    title: "",
-    scoreSection: "",
-    viewpointAnalysis: "",
-    thoughtStyle: "",
-    gapAnalysis: "",
-    valueBackground: "",
-    finalMessage: ""
-  };
-
-  const patterns = {
-    title: /【タイプ名】\s*(.+)/,
-    scoreSection: /【Day24〜29のスコア】([\s\S]*?)(?=【|$)/,
-    viewpointAnalysis: /【視点と反応の傾向】([\s\S]*?)(?=【|$)/,
-    thoughtStyle: /【思考スタイル分類】([\s\S]*?)(?=【|$)/,
-    gapAnalysis: /【理想と現実のギャップ】([\s\S]*?)(?=【|$)/,
-    valueBackground: /【価値観形成期と背景分析】([\s\S]*?)(?=【|$)/,
-    finalMessage: /【特に留意するべき点】([\s\S]*?)(?=【|$)/,
-  };
-
-  for (const key in patterns) {
-    const match = text.match(patterns[key]);
-    if (match) {
-      sections[key] = match[1].trim();
-    }
-  }
-
-  return sections;
-}
-
-// ===============================
-// 59．generateDay30StructureObject()
-// Day30構造出力（typeNameなど6項目）をパースして整形
-// ===============================
-function generateDay30StructureObject(gptText) {
-  const structure = {
-    typeName: "",
-    typeDescription: "",
-    conflictSection: "",
-    shiftSection: "",
-    valueFormationSection: "",
-    finalMessage: ""
-  };
-
-  const patterns = {
-    typeName: /typeName[:：]?\s*(.+)/i,
-    typeDescription: /typeDescription[:：]?\s*(.+)/i,
-    conflictSection: /conflictSection[:：]?\s*([\s\S]*?)(?=\n\S|$)/i,
-    shiftSection: /shiftSection[:：]?\s*([\s\S]*?)(?=\n\S|$)/i,
-    valueFormationSection: /valueFormationSection[:：]?\s*([\s\S]*?)(?=\n\S|$)/i,
-    finalMessage: /finalMessage[:：]?\s*([\s\S]*?)(?=\n\S|$)/i
-  };
-
-  for (const key in patterns) {
-    const match = gptText.match(patterns[key]);
-    if (match) {
-      structure[key] = match[1].trim();
-    }
-  }
-
-  return structure;
-}
-// ===============================
-// 60．generateDay30HtmlReport(parsed)
-// Day30レポートHTMLをテンプレートから生成（変数を差し込み）
-// ===============================
-function generateDay30HtmlReport(parsed) {
-  const template = HtmlService.createTemplateFromFile("template_day30");
-
-  // 差し込み用変数を代入
-  template.typeName = parsed.title;
-  template.typeDescription = parsed.catchPhrase;
-  template.scoreSection = parsed.scoreText;
-  template.dominantLayer = parsed.viewpointText;
-  template.thinkingType = parsed.thoughtStyleText;
-  template.conflictSection = parsed.gapText;
-  template.valueFormingBackground = parsed.backgroundText;
-  template.finalTips = parsed.adviceText;
-
-  // オプション：視点スコアチャート画像（base64）
-  template.viewpointChartBase64 = parsed.viewpointChartBase64 || null;
-
-  return template.evaluate().getContent();
-}
-
-// ===============================
-// 61．filterNegativeExpressionsFromGptOutput(parsed)
-// GPT出力の各セクションから過度な自己否定・決めつけ表現を検出し再構成
-// ===============================
-function filterNegativeExpressionsFromGptOutput(parsed) {
-  const filters = [
-    {
-      pattern: /私はダメな人間です|価値がない|誰にも必要とされていない|無意味|どうせ無理/i,
-      replace: "自己評価が下がっているように見えますが、その印象は感情に基づいていませんか？"
-    },
-    {
-      pattern: /普通じゃない|変わっているだけ|異常|まともじゃない/i,
-      replace: "“普通”や“変わっている”という基準は、どんな前提で使われていますか？"
-    },
-    {
-      pattern: /誰にも見つけられてないから才能がない|評価されない＝価値がない/i,
-      replace: "“見つけられていない”ことが“存在しない”とは限りません。見方を変えてみる余地がありそうです。"
-    },
-    {
-      pattern: /もう無理だ|可能性はない|終わりだ|やっても意味がない/i,
-      replace: "そのように感じるのは自然ですが、未来はまだ決定していません。他の可能性も見直せるかもしれません。"
-    }
-  ];
-
-  const sectionKeys = Object.keys(parsed);
-
-  for (const key of sectionKeys) {
-    if (!parsed[key]) continue;
-
-    let content = parsed[key];
-
-    for (const filter of filters) {
-      content = content.replace(filter.pattern, filter.replace);
-    }
-
-    parsed[key] = content;
-  }
-
-  return parsed;
-}
-// ===============================
-// 62．generateDay30HtmlReport(parsed)
-// レポートテンプレートHTMLを動的に生成
-// ===============================
-function generateDay30HtmlReport(parsed) {
-  const template = HtmlService.createTemplateFromFile("template_day30");
-
-  // 各セクションをテンプレートに代入
-  template.title = parsed.title || "Day30レポート";
-  template.scoreSection = parsed.scoreSection || "";
-  template.viewpointAnalysis = parsed.viewpointAnalysis || "";
-  template.thoughtStyle = parsed.thoughtStyle || "";
-  template.gapAnalysis = parsed.gapAnalysis || "";
-  template.valueBackground = parsed.valueBackground || "";
-  template.finalMessage = parsed.finalMessage || "";
-
-  // 🆕 レーダーチャート画像（base64）を埋め込み
-  template.viewpointChartBase64 = parsed.viewpointChartBase64 || null;
-
-  return template.evaluate().getContent();
-}
-// ===============================
-// 60．generateDay30HtmlReport()★★
-// 📄 HTMLテンプレートを取得し文字列として返す（Handlebarsで後処理）
-// ===============================
-function generateDay30HtmlReport() {
-  try {
-    const templateFile = HtmlService.createTemplateFromFile('template_day30');
-    const rawHtml = templateFile.getRawContent(); // ← テンプレートファイルの中身を取得
-    return rawHtml;
-  } catch (e) {
-    Logger.log('❌ generateDay30HtmlReport error: ' + e);
+    logErr('callChatGPT(wrapper)', e);
     return '';
   }
 }
+//  getWeather は PART 20 に実体があるため、ここでは再定義しません。getWeather() 呼び出しは PART 20 の実装が呼ばれます。
+
+/************************************************************
+ * PART 2: Webhook 入口（受付・整形）
+ ************************************************************/
+// （任意）表示名取得
+function getLineDisplayName(userId) {
+  try {
+    const url = `https://api.line.me/v2/bot/profile/${userId}`;
+    const res = UrlFetchApp.fetch(url, {
+      method: 'get',
+      headers: { Authorization: 'Bearer ' + PROP.CHANNEL_ACCESS_TOKEN },
+      muteHttpExceptions: true
+    });
+    if (res.getResponseCode() !== 200) {
+      try { logErr('getLineDisplayName http', res.getResponseCode() + ' ' + res.getContentText()); } catch(_){}
+      return '';
+    }
+    const json = JSON.parse(res.getContentText());
+    return String(json?.displayName || '');
+  } catch (e) {
+    try { logErr('getLineDisplayName', e); } catch(_){}
+    return '';
+  }
+}
+
+// Webhook エントリーポイント
+function doPost(e) {
+  try {
+    if (!e || !e.postData || !e.postData.contents) {
+      return ContentService.createTextOutput('OK').setMimeType(ContentService.MimeType.TEXT);
+    }
+
+    const json = JSON.parse(e.postData.contents);
+    const events = Array.isArray(json.events) ? json.events : [];
+
+    for (let i = 0; i < events.length; i++) {
+      handleLineEvent_(events[i], e); // ← PART 3 に分ける本体
+    }
+
+    return ContentService.createTextOutput('OK').setMimeType(ContentService.MimeType.TEXT);
+  } catch (err) {
+    try { logErr('doPost', err); } catch(_){}
+    return ContentService.createTextOutput('OK').setMimeType(ContentService.MimeType.TEXT);
+  }
+}
+/************************************************************
+ * PART 3: メッセージ解析とルーティング本体（完全統合版）
+ ************************************************************/
+function handleLineEvent_(event, rawE) {
+  try {
+    const userId  = event?.source?.userId;
+    const isText  = event?.type === 'message' && event?.message?.type === 'text';
+    const rawText = isText ? String(event.message.text || '') : '';
+    if (!userId || !rawText) return;
+
+    // 整形
+    const text         = rawText.replace(/\u3000/g, ' ').replace(/\s+/g, ' ').trim();
+    const textNoSpaces = text.replace(/\s/g, '');
+    Logger.log(`💬 [LINE受信] ${userId}: ${text}`);
+
+    /******************************************************
+     * ① スタート登録
+     ******************************************************/
+    if (/^スタート$/i.test(textNoSpaces)) {
+      const name = getLineDisplayName(userId) || '';
+      if (typeof registerUserIfNotExists_ === 'function') {
+        registerUserIfNotExists_(userId, name);
+      }
+      if (typeof sendInitialProfileRequest === 'function') {
+        sendInitialProfileRequest(userId);
+      } else {
+        sendTextMessage(
+          userId,
+          "登録が完了しました🌿\n次にMBTIを入力してください（例：INFJ）。\n分からなければ「スキップ」と入力してください。"
+        );
+      }
+      return;
+    }
+
+    /******************************************************
+     * ② MBTI または スキップ
+     ******************************************************/
+    const mbtiPattern = /^[IEie][NSns][FTft][JPjp]$/;
+    if (
+      typeof handleMbtiOrSkip === 'function' &&
+      (mbtiPattern.test(textNoSpaces) ||
+       /^スキップ$/i.test(textNoSpaces) ||
+       /^不明$/i.test(textNoSpaces))
+    ) {
+      handleMbtiOrSkip(userId, text);
+      return;
+    }
+
+    /******************************************************
+     * ③ Day1：観察仮説
+     ******************************************************/
+    if (
+      /^#?Day\s*1\b/i.test(text) ||
+      text.startsWith("#観察現象") ||
+      text.startsWith("#IfThen1")
+    ) {
+      if (typeof processDay1 === 'function') processDay1(userId, text);
+      return;
+    }
+
+    /******************************************************
+     * ④ Day2：構造分解
+     ******************************************************/
+    if (
+      /^#?Day\s*2\b/i.test(text) ||
+      text.startsWith("#引き金") ||
+      text.startsWith("#連鎖") ||
+      text.startsWith("#詰まり") ||
+      text.startsWith("#名前")
+    ) {
+      if (typeof processDay2 === 'function') processDay2(userId, text);
+      return;
+    }
+
+    /******************************************************
+     * ⑤ Day3：妨害要因
+     ******************************************************/
+    if (
+      /^#?Day\s*3\b/i.test(text) ||
+      text.startsWith("#妨害現象") ||
+      text.startsWith("#止まる理由") ||
+      text.startsWith("#IfThen3")
+    ) {
+      if (typeof processDay3 === 'function') processDay3(userId, text);
+      return;
+    }
+
+    /******************************************************
+     * ⑥ Day4〜9（Day6〜9：会話型）
+     ******************************************************/
+    if (/^#?Day\s*([4-9])\b/i.test(text) &&
+        typeof handleDay6to9Conversation_ === 'function') {
+      handleDay6to9Conversation_(userId, text);
+      return;
+    }
+
+    /******************************************************
+     * ⑦ Day10〜16（返信不可）
+     ******************************************************/
+    if (/^#?Day\s*(1[0-6])\b/i.test(text)) {
+      sendTextMessage(userId, "この期間は自動配信のみです🌤\nそのまま読んでいただくだけで大丈夫です。");
+      return;
+    }
+
+    /******************************************************
+     * ⑧ Day17〜29：本文／例を見る／pending
+     ******************************************************/
+    const mExample = text.match(/^#?Day\s*(1[7-9]|2[0-9])\s*例を見る$/i);
+    if (mExample && typeof handleExampleRequest === 'function') {
+      handleExampleRequest(userId, Number(mExample[1]));
+      return;
+    }
+
+    const mDay17to29 = text.match(/^#?Day\s*(1[7-9]|2[0-9])\b/i);
+    if (mDay17to29 && typeof processDay17to29Answer === 'function') {
+      processDay17to29Answer(userId, text, Number(mDay17to29[1]));
+      return;
+    }
+
+    if (typeof getPendingDay_ === 'function') {
+      const pending = Number(getPendingDay_(userId));
+      if (pending >= 17 && pending <= 29) {
+        processDay17to29Answer(userId, text, pending);
+        if (typeof clearPendingDay_ === 'function') clearPendingDay_(userId);
+        return;
+      }
+    }
+
+    /******************************************************
+     * ⑨ Day25〜30：自由記述の保存処理ルーティング（完成版）
+     ******************************************************/
+    if (routeDay25to30_(userId, text)) {
+      return;
+    }
+
+    /******************************************************
+     * ⑩ 任意ハッシュタグ
+     ******************************************************/
+    if (/#\w+/.test(text) &&
+        typeof handleFreeHashtagToNoubito === 'function') {
+      handleFreeHashtagToNoubito(userId, text);
+      return;
+    }
+
+    /******************************************************
+     * ⑪ その他：未分類
+     ******************************************************/
+    sendTextMessage(userId, "メッセージを受け取りました🌿");
+
+  } catch (err) {
+    logErr('handleLineEvent_', err);
+  }
+}
+
+/************************************************************
+ * PART 4: LINE Webhook 受信エントリーポイント（統合版）
+ ************************************************************/
+function doPost(e) {
+  try {
+    if (!e || !e.postData || !e.postData.contents) {
+      Logger.log('⚠️ doPost: postData が空です。');
+      return ContentService.createTextOutput('No data');
+    }
+
+    const data   = JSON.parse(e.postData.contents);
+    const events = Array.isArray(data.events) ? data.events : [];
+    if (events.length === 0) {
+      Logger.log('⚠️ doPost: events が存在しません。');
+      return ContentService.createTextOutput('No events');
+    }
+
+    events.forEach(event => {
+      try {
+        handleLineEvent_(event, e);
+      } catch (innerErr) {
+        logErr('handleLineEvent_', innerErr);
+      }
+    });
+
+    return ContentService.createTextOutput('OK');
+  } catch (err) {
+    logErr('doPost', err);
+    return ContentService.createTextOutput('Error');
+  }
+}
+
+/************************************************************
+ * PART 5: MBTI登録のタブ名・存在チェックと案内メッセージ（完成版）
+ ************************************************************/
+function handleMbtiOrSkip(userId, text) {
+  try {
+    const sheetId   = PROP.SHEET_ID_M;   // 管理シートID
+    const sheetName = "LINE";            // 実際のタブ名に合わせる
+
+    if (!sheetId) {
+      throw new Error("SHEET_ID_M が未設定です。Script Properties を確認してください。");
+    }
+
+    const sheet   = openSheetByIdAndName(sheetId, sheetName);
+    const row     = upsertRowByUserId(sheet, userId);
+    const colMbti = colByHeader(sheet, "MBTI");
+
+    if (!colMbti) {
+      throw new Error(`MBTI列が見つかりません（タブ: ${sheetName}）。`);
+    }
+
+    // 入力値を整形（大文字・空白除去）
+    let mbtiValue = String(text || "").trim().toUpperCase().replace(/\s/g, "");
+
+    // スキップ・不明 → 未設定
+    if (/^スキップ$/i.test(mbtiValue) || /^不明$/i.test(mbtiValue)) {
+      mbtiValue = "未設定";
+    } else if (!/^[IE][NS][FT][JP]$/i.test(mbtiValue)) {
+      // フォーマット不正
+      sendTextMessage(
+        userId,
+        "MBTIの形式が正しくありません。\n" +
+        "例：INFJ / ESTP / INFP のように4文字で入力してください。\n" +
+        "分からなければ「スキップ」と入力してください。"
+      );
+      return;
+    }
+
+    // シートに保存
+    sheet.getRange(row, colMbti).setValue(mbtiValue);
+
+    // ユーザーへの案内メッセージ
+    const msg =
+      mbtiValue === "未設定"
+        ? "MBTIは未設定のまま進みます🌱\n明日の朝6時頃にDay1のメッセージをお届けします。"
+        : `MBTIを「${mbtiValue}」として登録しました🌿\n明日の朝6時頃にDay1のメッセージをお届けします。`;
+
+    sendTextMessage(userId, msg);
+
+    // Day0 のウェルカムメッセージ（あれば）
+    if (typeof sendDay0WelcomeMessage === "function") {
+      sendDay0WelcomeMessage(userId, mbtiValue);
+    }
+
+  } catch (err) {
+    logErr("handleMbtiOrSkip", err);
+    sendTextMessage(userId, "MBTIの登録でエラーが発生しました。時間をおいて再試行してください。");
+  }
+}
+
+/************************************************************
+ * PART 6: Day1〜3 保存ディスパッチャ
+ ************************************************************/
+function handleDay1to3Save(userId, text) {
+  const sheet = openSheetByIdAndName(PROP.SHEET_ID_M, "noubito_回答");
+  const row = upsertRowByUserId(sheet, userId);
+  const timestamp = new Date();
+
+  // Day番号を抽出
+  const m = text.match(/^#?Day\s*(\d+)\s*(.*)$/i);
+  if (!m) return;
+  const day = Number(m[1]);
+  const body = String(m[2] || "").trim();
+
+  switch (day) {
+
+    /***************************
+     * Day1
+     ***************************/
+    case 1:
+      if (/^#?観察/i.test(body)) {
+        const val = body.replace(/^#?観察[＝=:\s]*/i, "");
+        sheet.getRange(row, colByHeader(sheet, "Day1_観察")).setValue(val);
+      } else if (/^#?ifthen/i.test(body)) {
+        const val = body.replace(/^#?ifthen[＝=:\s]*/i, "");
+        sheet.getRange(row, colByHeader(sheet, "Day1_IfThen")).setValue(val);
+      }
+      break;
+
+    /***************************
+     * Day2
+     ***************************/
+    case 2:
+      if (/^#?引き金/i.test(body)) {
+        const val = body.replace(/^#?引き金[＝=:\s]*/i, "");
+        sheet.getRange(row, colByHeader(sheet, "Day2_引き金")).setValue(val);
+      } else if (/^#?連鎖/i.test(body)) {
+        const val = body.replace(/^#?連鎖[＝=:\s]*/i, "");
+        sheet.getRange(row, colByHeader(sheet, "Day2_連鎖")).setValue(val);
+      } else if (/^#?詰まり/i.test(body)) {
+        const val = body.replace(/^#?詰まり[＝=:\s]*/i, "");
+        sheet.getRange(row, colByHeader(sheet, "Day2_詰まり")).setValue(val);
+      } else if (/^#?名前/i.test(body)) {
+        const val = body.replace(/^#?名前[＝=:\s]*/i, "");
+        sheet.getRange(row, colByHeader(sheet, "Day2_名前")).setValue(val);
+      }
+      break;
+
+    /***************************
+     * Day3
+     ***************************/
+    case 3:
+      if (/^#?妨害現象/i.test(body)) {
+        const val = body.replace(/^#?妨害現象[＝=:\s]*/i, "");
+        sheet.getRange(row, colByHeader(sheet, "Day3_妨害現象")).setValue(val);
+      } else if (/^#?止まる理由/i.test(body)) {
+        const val = body.replace(/^#?止まる理由[＝=:\s]*/i, "");
+        sheet.getRange(row, colByHeader(sheet, "Day3_止まる理由")).setValue(val);
+      } else if (/^#?ifthen/i.test(body)) {
+        const val = body.replace(/^#?ifthen[＝=:\s]*/i, "");
+        sheet.getRange(row, colByHeader(sheet, "Day3_IfThen")).setValue(val);
+      }
+      break;
+  }
+
+  // 共通保存：timestamp
+  sheet.getRange(row, colByHeader(sheet, "timestamp")).setValue(timestamp);
+}
+
+/************************************************************
+ * PART 7: Day1〜3 保存処理（完成版）
+ ************************************************************/
+
+/************************************************************
+ * Day1：観察仮説（#観察現象 / #IfThen1）
+ ************************************************************/
+function processDay1(userId, text) {
+  try {
+    const sheet = openSheetByIdAndName(PROP.SHEET_ID_M, "LINE");
+    const row   = upsertRowByUserId(sheet, userId);
+
+    const map = {
+      "#観察現象": "Day1_観察現象",
+      "#IfThen1": "Day1_IfThen"
+    };
+
+    let saved = false;
+
+    for (const tag in map) {
+      if (text.startsWith(tag)) {
+        const col = colByHeader(sheet, map[tag]);
+        if (col) {
+          const value = text.replace(tag, "").trim();
+          sheet.getRange(row, col).setValue(value);
+          saved = true;
+        }
+      }
+    }
+
+    if (saved) {
+      sendTextMessage(userId, "Day1 の回答を記録しました🌿");
+    } else {
+      sendTextMessage(userId, "Day1 の入力形式が確認できませんでした。");
+    }
+
+  } catch (err) {
+    logErr("processDay1", err);
+    sendTextMessage(userId, "Day1 の保存でエラーが発生しました。");
+  }
+}
+
+/************************************************************
+ * Day2：構造分解（#引き金 / #連鎖 / #詰まり / #名前）
+ ************************************************************/
+function processDay2(userId, text) {
+  try {
+    const sheet = openSheetByIdAndName(PROP.SHEET_ID_M, "LINE");
+    const row   = upsertRowByUserId(sheet, userId);
+
+    const map = {
+      "#引き金": "Day2_引き金",
+      "#連鎖":   "Day2_連鎖",
+      "#詰まり": "Day2_詰まり",
+      "#名前":   "Day2_名前"
+    };
+
+    let saved = false;
+
+    for (const tag in map) {
+      if (text.startsWith(tag)) {
+        const col = colByHeader(sheet, map[tag]);
+        if (col) {
+          const value = text.replace(tag, "").trim();
+          sheet.getRange(row, col).setValue(value);
+          saved = true;
+        }
+      }
+    }
+
+    if (saved) {
+      sendTextMessage(userId, "Day2 の回答を記録しました🌿");
+    } else {
+      sendTextMessage(userId, "Day2 の入力形式が確認できませんでした。");
+    }
+
+  } catch (err) {
+    logErr("processDay2", err);
+    sendTextMessage(userId, "Day2 の保存でエラーが発生しました。");
+  }
+}
+
+/************************************************************
+ * Day3：妨害要因（#妨害現象 / #止まる理由 / #IfThen3）
+ ************************************************************/
+function processDay3(userId, text) {
+  try {
+    const sheet = openSheetByIdAndName(PROP.SHEET_ID_M, "LINE");
+    const row   = upsertRowByUserId(sheet, userId);
+
+    const map = {
+      "#妨害現象": "Day3_妨害現象",
+      "#止まる理由": "Day3_止まる理由",
+      "#IfThen3":    "Day3_IfThen"
+    };
+
+    let saved = false;
+
+    for (const tag in map) {
+      if (text.startsWith(tag)) {
+        const col = colByHeader(sheet, map[tag]);
+        if (col) {
+          const value = text.replace(tag, "").trim();
+          sheet.getRange(row, col).setValue(value);
+          saved = true;
+        }
+      }
+    }
+
+    if (saved) {
+      sendTextMessage(userId, "Day3 の回答を記録しました🌿");
+    } else {
+      sendTextMessage(userId, "Day3 の入力形式が確認できませんでした。");
+    }
+
+  } catch (err) {
+    logErr("processDay3", err);
+    sendTextMessage(userId, "Day3 の保存でエラーが発生しました。");
+  }
+}
+
+/************************************************************
+ * PART 7: Day4〜6 ルーティング拡張（新仕様対応）
+ * - Day4：五感スイッチ（#五感スイッチ / #場面文脈 / #IfThen）
+ * - Day5：環境スイッチ（#環境要因 / #反応変化 / #IfThen）
+ * - Day6：テーマ抽出（#主観テーマ / #反復ワード / #IfThen）
+ ************************************************************/
+function handleLineEvent_Day4to6(userId, text) {
+
+  /******************************************************
+   * Day4（五感スイッチ）
+   ******************************************************/
+  if (
+    /^#?Day\s*4\b/i.test(text) ||
+    text.startsWith("#五感スイッチ") ||
+    text.startsWith("#場面文脈") ||
+    text.startsWith("#IfThen")
+  ) {
+    if (typeof processDay4 === 'function') {
+      processDay4(userId, text);
+    } else {
+      sendTextMessage(userId, "Day4 の処理が未実装です。");
+    }
+    return true;
+  }
+
+  /******************************************************
+   * Day5（環境スイッチ）
+   ******************************************************/
+  if (
+    /^#?Day\s*5\b/i.test(text) ||
+    text.startsWith("#環境要因") ||
+    text.startsWith("#反応変化") ||
+    text.startsWith("#IfThen")
+  ) {
+    if (typeof processDay5 === 'function') {
+      processDay5(userId, text);
+    } else {
+      sendTextMessage(userId, "Day5 の処理が未実装です。");
+    }
+    return true;
+  }
+
+  /******************************************************
+   * Day6（テーマ抽出）
+   ******************************************************/
+  if (
+    /^#?Day\s*6\b/i.test(text) ||
+    text.startsWith("#主観テーマ") ||
+    text.startsWith("#反復ワード") ||
+    text.startsWith("#IfThen")
+  ) {
+    if (typeof processDay6 === 'function') {
+      processDay6(userId, text);
+    } else {
+      sendTextMessage(userId, "Day6 の処理が未実装です。");
+    }
+    return true;
+  }
+
+  return false; // Day4〜6 ではない
+}
+
+/************************************************************
+ * PART 8: Day4〜6 保存処理
+ ************************************************************/
+/************************************************************
+ * 共通：保存ユーティリティ
+ ************************************************************/
+function saveToSheet(sheetId, sheetName, userId, valuesObj) {
+  const sheet = openSheetByIdAndName(sheetId, sheetName);
+  const row   = upsertRowByUserId(sheet, userId);
+  const tsCol = colByHeader(sheet, "timestamp");
+
+  // 各フィールドを保存
+  Object.keys(valuesObj).forEach(key => {
+    const col = colByHeader(sheet, key);
+    if (col) sheet.getRange(row, col).setValue(valuesObj[key]);
+  });
+
+  // タイムスタンプ更新
+  if (tsCol) sheet.getRange(row, tsCol).setValue(new Date());
+}
+
+/************************************************************
+ * Day4 保存処理：五感スイッチ
+ ************************************************************/
+function processDay4(userId, text) {
+  const sheetId   = PROP.SHEET_ID_M;
+  const sheetName = "noubito_回答";
+
+  // Day番号
+  const dayNumber = 4;
+
+  // プレフィックスによる分類
+  let sensorySwitch = "";
+  let situationContext = "";
+  let ifThenRule = "";
+
+  if (/^#?Day\s*4\b/i.test(text)) {
+    // 何も指定なし — Day番号だけ送る場合
+  } else if (text.startsWith("#五感スイッチ")) {
+    sensorySwitch = text.replace(/^#?五感スイッチ[=：:\s]*/i, "").trim();
+  } else if (text.startsWith("#場面文脈")) {
+    situationContext = text.replace(/^#?場面文脈[=：:\s]*/i, "").trim();
+  } else if (text.startsWith("#IfThen")) {
+    ifThenRule = text.replace(/^#?IfThen[=：:\s]*/i, "").trim();
+  }
+
+  // 保存
+  saveToSheet(sheetId, sheetName, userId, {
+    dayNumber,
+    sensorySwitch,
+    situationContext,
+    ifThenRule
+  });
+
+  sendTextMessage(userId, "Day4 を受け取りました🌱");
+}
+
+/************************************************************
+ * Day5 保存処理：環境スイッチ
+ ************************************************************/
+function processDay5(userId, text) {
+  const sheetId   = PROP.SHEET_ID_M;
+  const sheetName = "noubito_回答";
+
+  const dayNumber = 5;
+
+  let environmentFactor = "";
+  let responseChange = "";
+  let ifThenRule = "";
+
+  if (/^#?Day\s*5\b/i.test(text)) {
+    // Day番号だけ
+  } else if (text.startsWith("#環境要因")) {
+    environmentFactor = text.replace(/^#?環境要因[=：:\s]*/i, "").trim();
+  } else if (text.startsWith("#反応変化")) {
+    responseChange = text.replace(/^#?反応変化[=：:\s]*/i, "").trim();
+  } else if (text.startsWith("#IfThen")) {
+    ifThenRule = text.replace(/^#?IfThen[=：:\s]*/i, "").trim();
+  }
+
+  saveToSheet(sheetId, sheetName, userId, {
+    dayNumber,
+    environmentFactor,
+    responseChange,
+    ifThenRule
+  });
+
+  sendTextMessage(userId, "Day5 を受け取りました🌿");
+}
+
+/************************************************************
+ * Day6 保存処理：テーマ抽出
+ ************************************************************/
+function processDay6(userId, text) {
+  const sheetId   = PROP.SHEET_ID_M;
+  const sheetName = "noubito_回答";
+
+  const dayNumber = 6;
+
+  let themeFocus = "";
+  let repeatedWords = "";
+  let ifThenRule = "";
+
+  if (/^#?Day\s*6\b/i.test(text)) {
+    // Day番号だけ
+  } else if (text.startsWith("#主観テーマ")) {
+    themeFocus = text.replace(/^#?主観テーマ[=：:\s]*/i, "").trim();
+  } else if (text.startsWith("#反復ワード")) {
+    repeatedWords = text.replace(/^#?反復ワード[=：:\s]*/i, "").trim();
+  } else if (text.startsWith("#IfThen")) {
+    ifThenRule = text.replace(/^#?IfThen[=：:\s]*/i, "").trim();
+  }
+
+  saveToSheet(sheetId, sheetName, userId, {
+    dayNumber,
+    themeFocus,
+    repeatedWords,
+    ifThenRule
+  });
+
+  sendTextMessage(userId, "Day6 を受け取りました✨");
+}
+
+/************************************************************
+ * PART 9: Day4〜9 メッセージ分岐ハンドラ（会話型・例文対応）
+ * - handleLineEvent_ から呼ばれる
+ * - Day4〜6: 既存の processDay4 / 5 / 6 を呼び出し
+ * - Day7〜9: 例リクエスト（「#Day7 例を見る」など）＋保存処理
+ ************************************************************/
+function handleDay6to9Conversation_(userId, text) {
+  try {
+    // Day番号＋残りテキスト抽出
+    const m = text.match(/^#?Day\s*(\d+)\s*(.*)$/i);
+    if (!m) {
+      sendTextMessage(userId, "Day番号の形式が確認できませんでした。");
+      return;
+    }
+
+    const dayNumber = Number(m[1]);        // 4〜9 を想定
+    const rest = (m[2] || "").trim();     // 「#行動理由〜」など Dayタグ以降
+    const isExampleRequest = /例を見る/.test(rest);
+
+    switch (dayNumber) {
+      /******************************************************
+       * Day4：五感スイッチ（既存処理を呼び出し）
+       ******************************************************/
+      case 4:
+        if (typeof processDay4 === "function") {
+          const payload = rest && rest.startsWith("#") ? rest : text;
+          processDay4(userId, payload);
+        } else {
+          sendTextMessage(userId, "Day4 の処理が未実装です。");
+        }
+        return;
+
+      /******************************************************
+       * Day5：環境スイッチ（既存処理を呼び出し）
+       ******************************************************/
+      case 5:
+        if (typeof processDay5 === "function") {
+          const payload = rest && rest.startsWith("#") ? rest : text;
+          processDay5(userId, payload);
+        } else {
+          sendTextMessage(userId, "Day5 の処理が未実装です。");
+        }
+        return;
+
+      /******************************************************
+       * Day6：テーマ抽出（既存処理を呼び出し）
+       ******************************************************/
+      case 6:
+        if (typeof processDay6 === "function") {
+          const payload = rest && rest.startsWith("#") ? rest : text;
+          processDay6(userId, payload);
+        } else {
+          sendTextMessage(userId, "Day6 の処理が未実装です。");
+        }
+        return;
+
+      /******************************************************
+       * Day7：理由化・動機分析
+       ******************************************************/
+      case 7:
+        if (isExampleRequest) {
+          const exampleMsg =
+            "▼ #行動理由 例\n" +
+            "・間違えないようにしている\n" +
+            "・相手に悪く思われたくない\n" +
+            "・やるからには完璧にしたい\n" +
+            "・場がシラけるのが嫌\n\n" +
+            "▼ #感情動機 例\n" +
+            "・評価されたい／嫌われたくない\n" +
+            "・自分を守りたい／不安を避けたい\n" +
+            "・成果が出ないと無価値に思える\n" +
+            "・責任を果たさないといけない感じ\n\n" +
+            "▼ #IfThen 例\n" +
+            "・「“嫌われたくない”が浮かんだら→深呼吸＋一呼吸置く」\n" +
+            "・「“完璧にしたい”が強まったら→6割で一度提出」\n" +
+            "・「“失いたくない”が来たら→立って姿勢を変える」";
+          sendTextMessage(userId, exampleMsg);
+          return;
+        }
+
+        if (typeof processDay7 === "function") {
+          const payload = rest && rest.startsWith("#") ? rest : text;
+          processDay7(userId, payload);
+        } else {
+          sendTextMessage(userId, "Day7 の処理が未実装です。");
+        }
+        return;
+
+      /******************************************************
+       * Day8：一手と到達点設定
+       ******************************************************/
+      case 8:
+        if (isExampleRequest) {
+          const exampleMsg =
+            "▼ #最小一手 例\n" +
+            "・冒頭5分の内容を下書きだけする\n" +
+            "・10件だけリストアップして止める\n" +
+            "・“3分だけ手を動かす”をタイマーでやる\n\n" +
+            "▼ #到達点イメージ 例\n" +
+            "・タイマーが鳴った\n" +
+            "・紙1枚に要素を書けた\n" +
+            "・メール1本下書きしたら完了\n\n" +
+            "▼ #IfThen 例\n" +
+            "・「集中が切れたら→立って姿勢を変える」\n" +
+            "・「SNSに手が伸びたら→携帯を自分と別の部屋に置く」\n" +
+            "・「止まりそうになったら→“やったら終われる”と声に出す」";
+          sendTextMessage(userId, exampleMsg);
+          return;
+        }
+
+        if (typeof processDay8 === "function") {
+          const payload = rest && rest.startsWith("#") ? rest : text;
+          processDay8(userId, payload);
+        } else {
+          sendTextMessage(userId, "Day8 の処理が未実装です。");
+        }
+        return;
+
+      /******************************************************
+       * Day9：障害と回避の統合
+       ******************************************************/
+      case 9:
+        if (isExampleRequest) {
+          const exampleMsg =
+            "▼ #障害パターン 例\n" +
+            "・午後になると決断が鈍る\n" +
+            "・失敗を連想すると動きが止まる\n" +
+            "・上司の顔を思い出すと避けたくなる\n\n" +
+            "▼ #再接続ルール 例\n" +
+            "・一旦外に出る／飲み物を変える\n" +
+            "・「ここまでやっただけでOK」と声に出す\n" +
+            "・TODOを3分だけ書き直す\n\n" +
+            "▼ #自己スキーム化 例\n" +
+            "・不安になると先延ばし→深呼吸→次の1分だけ決める\n" +
+            "・完璧主義で止まる→敢えて“雑”に始めてみる\n" +
+            "・話したくなる→チャット下書きだけして保存";
+          sendTextMessage(userId, exampleMsg);
+          return;
+        }
+
+        if (typeof processDay9 === "function") {
+          const payload = rest && rest.startsWith("#") ? rest : text;
+          processDay9(userId, payload);
+        } else {
+          sendTextMessage(userId, "Day9 の処理が未実装です。");
+        }
+        return;
+
+      default:
+        // handleLineEvent_ 側の正規表現が間違っていない限り来ないはず
+        sendTextMessage(userId, "Day4〜9 の範囲外の入力です。");
+        return;
+    }
+
+  } catch (err) {
+    logErr("handleDay6to9Conversation_", err);
+    sendTextMessage(userId, "Day4〜9 の処理中にエラーが発生しました。");
+  }
+}
+
+/************************************************************
+ * PART 10: Day7 保存処理：理由化・動機分析
+ * シート: PROP.SHEET_ID_M / タブ: noubito_回答
+ * カラム: dayNumber(7), reasonAction, emotionalDriver, ifThenRule
+ ************************************************************/
+function processDay7(userId, text) {
+  try {
+    const sheetId   = PROP.SHEET_ID_M;
+    const sheetName = "noubito_回答";
+    const dayNumber = 7;
+
+    let reasonAction    = "";
+    let emotionalDriver = "";
+    let ifThenRule      = "";
+
+    if (/^#?Day\s*7\b/i.test(text)) {
+      // Day番号だけ（イントロなど）→ dayNumber のみ保存したい場合
+    } else if (text.startsWith("#行動理由")) {
+      reasonAction = text.replace(/^#?行動理由[=：:\s]*/i, "").trim();
+    } else if (text.startsWith("#感情動機")) {
+      emotionalDriver = text.replace(/^#?感情動機[=：:\s]*/i, "").trim();
+    } else if (text.startsWith("#IfThen")) {
+      ifThenRule = text.replace(/^#?IfThen[=：:\s]*/i, "").trim();
+    }
+
+    saveToSheet(sheetId, sheetName, userId, {
+      dayNumber,
+      reasonAction,
+      emotionalDriver,
+      ifThenRule
+    });
+
+    sendTextMessage(userId, "Day7 を受け取りました🌿");
+  } catch (err) {
+    logErr("processDay7", err);
+    sendTextMessage(userId, "Day7 の保存でエラーが発生しました。");
+  }
+}
+
+/************************************************************
+ * PART 11: Day8 保存処理：一手と到達点設定
+ * シート: PROP.SHEET_ID_M / タブ: noubito_回答
+ * カラム: dayNumber(8), minimalAction, doneCriteria, ifThenRule
+ ************************************************************/
+function processDay8(userId, text) {
+  try {
+    const sheetId   = PROP.SHEET_ID_M;
+    const sheetName = "noubito_回答";
+    const dayNumber = 8;
+
+    let minimalAction = "";
+    let doneCriteria  = "";
+    let ifThenRule    = "";
+
+    if (/^#?Day\s*8\b/i.test(text)) {
+      // Day番号だけ
+    } else if (text.startsWith("#最小一手")) {
+      minimalAction = text.replace(/^#?最小一手[=：:\s]*/i, "").trim();
+    } else if (text.startsWith("#到達点イメージ")) {
+      doneCriteria = text.replace(/^#?到達点イメージ[=：:\s]*/i, "").trim();
+    } else if (text.startsWith("#IfThen")) {
+      ifThenRule = text.replace(/^#?IfThen[=：:\s]*/i, "").trim();
+    }
+
+    saveToSheet(sheetId, sheetName, userId, {
+      dayNumber,
+      minimalAction,
+      doneCriteria,
+      ifThenRule
+    });
+
+    sendTextMessage(userId, "Day8 を受け取りました🎯");
+  } catch (err) {
+    logErr("processDay8", err);
+    sendTextMessage(userId, "Day8 の保存でエラーが発生しました。");
+  }
+}
+
+/************************************************************
+ * PART 12: Day9 保存処理：障害と回避の統合
+ * シート: PROP.SHEET_ID_M / タブ: noubito_回答
+ * カラム: dayNumber(9), obstaclePattern, reconnectRule, selfScheme
+ ************************************************************/
+function processDay9(userId, text) {
+  try {
+    const sheetId   = PROP.SHEET_ID_M;
+    const sheetName = "noubito_回答";
+    const dayNumber = 9;
+
+    let obstaclePattern = "";
+    let reconnectRule   = "";
+    let selfScheme      = "";
+
+    if (/^#?Day\s*9\b/i.test(text)) {
+      // Day番号だけ
+    } else if (text.startsWith("#障害パターン")) {
+      obstaclePattern = text.replace(/^#?障害パターン[=：:\s]*/i, "").trim();
+    } else if (text.startsWith("#再接続ルール")) {
+      reconnectRule = text.replace(/^#?再接続ルール[=：:\s]*/i, "").trim();
+    } else if (text.startsWith("#自己スキーム化")) {
+      selfScheme = text.replace(/^#?自己スキーム化[=：:\s]*/i, "").trim();
+    }
+
+    saveToSheet(sheetId, sheetName, userId, {
+      dayNumber,
+      obstaclePattern,
+      reconnectRule,
+      selfScheme
+    });
+
+    sendTextMessage(userId, "Day9 を受け取りました🔄");
+  } catch (err) {
+    logErr("processDay9", err);
+    sendTextMessage(userId, "Day9 の保存でエラーが発生しました。");
+  }
+}
+
+/************************************************************
+ * PART 13:Day7保存処理：行動理由・感情動機・IfThen
+ ************************************************************/
+function processDay7(userId, text) {
+  const sheetId   = PROP.SHEET_ID_M;
+  const sheetName = "noubito_回答";
+
+  const sheet = openSheetByIdAndName(sheetId, sheetName);
+  const row   = upsertRowByUserId(sheet, userId);
+
+  let actionReason = "";
+  let emotionMotive = "";
+  let ifThenRule = "";
+
+  // Day7：3つのタグで分岐
+  if (text.startsWith("#行動理由")) {
+    actionReason = text.replace(/^#行動理由[=：:\s]*/i, "").trim();
+  } 
+  else if (text.startsWith("#感情動機")) {
+    emotionMotive = text.replace(/^#感情動機[=：:\s]*/i, "").trim();
+  } 
+  else if (text.startsWith("#IfThen")) {
+    ifThenRule = text.replace(/^#?IfThen[=：:\s]*/i, "").trim();
+  }
+
+  // 保存（あなたの列名に完全一致）
+  const saveObj = {};
+  if (actionReason)  saveObj["Day7_行動理由"]   = actionReason;
+  if (emotionMotive) saveObj["Day7_感情動機"]   = emotionMotive;
+  if (ifThenRule)    saveObj["Day7_IfThen"]     = ifThenRule;
+
+  if (Object.keys(saveObj).length > 0) {
+    saveToSheet(sheetId, sheetName, userId, saveObj);
+    sendTextMessage(userId, "Day7 を受け取りました🌿");
+  } else {
+    sendTextMessage(userId, "Day7 の入力形式が確認できませんでした。");
+  }
+}
+/************************************************************
+ * PART 14: Day8 保存処理：最小一手・到達点イメージ・IfThen
+ ************************************************************/
+function processDay8(userId, text) {
+  const sheetId   = PROP.SHEET_ID_M;
+  const sheetName = "noubito_回答";
+
+  const dayNumber = 8;
+
+  let minimalAction = "";
+  let goalImage = "";
+  let ifThenRule = "";
+
+  // Day番号だけ送られた場合
+  if (/^#?Day\s*8\b/i.test(text)) {
+    // そのまま保存（空欄）
+  } 
+  // #最小一手
+  else if (text.startsWith("#最小一手")) {
+    minimalAction = text.replace(/^#?最小一手[=：:\s]*/i, "").trim();
+  } 
+  // #到達点イメージ
+  else if (text.startsWith("#到達点イメージ")) {
+    goalImage = text.replace(/^#?到達点イメージ[=：:\s]*/i, "").trim();
+  } 
+  // #IfThen
+  else if (text.startsWith("#IfThen")) {
+    ifThenRule = text.replace(/^#?IfThen[=：:\s]*/i, "").trim();
+  }
+
+  // 保存
+  saveToSheet(sheetId, sheetName, userId, {
+    dayNumber,
+    Day8_最小一手: minimalAction,
+    Day8_到達点イメージ: goalImage,
+    Day8_IfThen: ifThenRule
+  });
+
+  sendTextMessage(userId, "Day8 を受け取りました💡");
+}
+
+/************************************************************
+ * PART 14: Day8 保存処理：最小一手・到達点イメージ・IfThen
+ ************************************************************/
+function processDay8(userId, text) {
+  const sheetId   = PROP.SHEET_ID_M;
+  const sheetName = "noubito_回答";
+
+  const dayNumber = 8;
+
+  let minAction = "";
+  let targetImage = "";
+  let ifThenRule = "";
+
+  // Day番号だけ送る場合
+  if (/^#?Day\s*8\b/i.test(text)) {
+    // 何もしない（空保存）
+  } else if (text.startsWith("#最小一手")) {
+    minAction = text.replace(/^#?最小一手[=：:\s]*/i, "").trim();
+  } else if (text.startsWith("#到達点イメージ")) {
+    targetImage = text.replace(/^#?到達点イメージ[=：:\s]*/i, "").trim();
+  } else if (text.startsWith("#IfThen")) {
+    ifThenRule = text.replace(/^#?IfThen[=：:\s]*/i, "").trim();
+  }
+
+  // 保存
+  saveToSheet(sheetId, sheetName, userId, {
+    dayNumber,
+    Day8_最小一手: minAction,
+    Day8_到達点イメージ: targetImage,
+    Day8_IfThen: ifThenRule
+  });
+
+  sendTextMessage(userId, "Day8 を受け取りました📘");
+}
+/************************************************************
+ * PART 15: Day9 保存処理：障害パターン・再接続ルール・自己スキーム化・IfThen
+ ************************************************************/
+function processDay9(userId, text) {
+  const sheetId   = PROP.SHEET_ID_M;
+  const sheetName = "noubito_回答";
+
+  const dayNumber = 9;
+
+  // 保存対象フィールド
+  let 障害パターン = "";
+  let 再接続ルール = "";
+  let 自己スキーム化 = "";
+  let ifThenRule = "";
+
+  // Day番号だけ送られた場合
+  if (/^#?Day\s*9\b/i.test(text)) {
+    // 何も保存しない
+  }
+  // 各タグで振り分け
+  else if (text.startsWith("#障害パターン")) {
+    障害パターン = text.replace(/^#?障害パターン[=：:\s]*/i, "").trim();
+  }
+  else if (text.startsWith("#再接続ルール")) {
+    再接続ルール = text.replace(/^#?再接続ルール[=：:\s]*/i, "").trim();
+  }
+  else if (text.startsWith("#自己スキーム化")) {
+    自己スキーム化 = text.replace(/^#?自己スキーム化[=：:\s]*/i, "").trim();
+  }
+  else if (text.startsWith("#IfThen")) {
+    ifThenRule = text.replace(/^#?IfThen[=：:\s]*/i, "").trim();
+  }
+
+  // 保存
+  saveToSheet(sheetId, sheetName, userId, {
+    dayNumber,
+    Day9_障害パターン: 障害パターン,
+    Day9_再接続ルール: 再接続ルール,
+    Day9_自己スキーム化: 自己スキーム化,
+    Day9_IfThen: ifThenRule
+  });
+
+  // 返信
+  sendTextMessage(userId, "Day9 を受け取りました🌱");
+}
+/************************************************************
+ * PART 14: Day10 保存処理（Reframe：枠組みの再定義）
+ * 保存先列：
+ * AJ: Day10_観察現象
+ * AK: Day10_自動的意味づけ
+ * AL: Day10_前提
+ * AM: Day10_問い直し
+ * AN: Day10_新しい意味づけ
+ ************************************************************/
+function processDay10Answer(userId, text) {
+  try {
+    const sheet = getNoubitoMainSheet_();
+    const row = findUserRow_(sheet, userId);
+    if (!row) {
+      replyToUser(userId, "登録情報が見つかりませんでした。");
+      return;
+    }
+
+    // ① 入力形式：#Day10 観察現象｜自動的意味づけ｜前提｜問い直し｜新しい意味づけ
+    const cleaned = text.replace(/^#Day10/i, "").trim();
+    const parts = cleaned.split("｜");
+
+    if (parts.length < 5) {
+      replyToUser(userId, "Day10の回答は「5つの項目」を ｜ で区切って送ってください。\n例）#Day10 ○○｜○○｜○○｜○○｜○○");
+      return;
+    }
+
+    const observed = parts[0].trim();        // 観察現象
+    const autoMeaning = parts[1].trim();     // 自動的な意味づけ
+    const premise = parts[2].trim();         // 前提
+    const question = parts[3].trim();        // 問い直し
+    const newMeaning = parts[4].trim();      // 新しい意味づけ
+
+    // ② シートへ保存
+    sheet.getRange(row, COL_DAY10_OBSERVED).setValue(observed);
+    sheet.getRange(row, COL_DAY10_AUTO_MEANING).setValue(autoMeaning);
+    sheet.getRange(row, COL_DAY10_PREMISE).setValue(premise);
+    sheet.getRange(row, COL_DAY10_REQUESTION).setValue(question);
+    sheet.getRange(row, COL_DAY10_NEW_MEANING).setValue(newMeaning);
+
+    // ③ ユーザーへ返信
+    replyToUser(userId, "Day10の回答を受け取りました。");
+
+  } catch (e) {
+    Logger.log("❌ Day10保存エラー: " + e);
+    replyToUser(userId, "エラーが発生しました。もう一度送ってください。");
+  }
+}
+
+/************************************************************
+ * PART 15: Day11 保存処理（選択行動・判断基準・価値観・優先ポイント・再選択）
+ ************************************************************/
+function processDay11Answer(userId, text) {
+  try {
+    const sheet = getNoubitoSheet_(); // スプレッドシート取得
+    const row = findUserRow(userId, sheet); // ユーザー行を取得
+    if (!row) {
+      logErr('processDay11', 'ユーザー行なし userId=' + userId);
+      return;
+    }
+
+    // ---- 1. 回答テキストを Day11 用にパース ----
+    // 期待形式：
+    // #Day11
+    // 選択行動: xxx
+    // 明示理由: xxx
+    // 暗黙価値: xxx
+    // 優先ポイント: xxx
+    // 再選択: xxx
+
+    const parsed = parseDay11Format_(text);
+
+    // ---- 2. スプレッドシートへ保存 ----
+    // AN: 選択行動
+    // AO: 明示理由
+    // AP: 暗黙価値
+    // AQ: 優先ポイント
+    // AR: 再選択
+
+    sheet.getRange(row, COL.Day11_selectedAction).setValue(parsed.selectedAction);
+    sheet.getRange(row, COL.Day11_explicitReason).setValue(parsed.explicitReason);
+    sheet.getRange(row, COL.Day11_implicitValue).setValue(parsed.implicitValue);
+    sheet.getRange(row, COL.Day11_truePriority).setValue(parsed.truePriority);
+    sheet.getRange(row, COL.Day11_reSelection).setValue(parsed.reSelection);
+
+    // ---- 3. 完了メッセージ ----
+    replyToUser(userId, "Day11 の回答を受け取りました。");
+
+  } catch (e) {
+    logErr('processDay11Answer', e);
+  }
+}
+
+/************************************************************
+ * Day11 回答パーサー（自由記述テキスト → 各項目に分解）
+ ************************************************************/
+function parseDay11Format_(text) {
+  const obj = {
+    selectedAction: "",
+    explicitReason: "",
+    implicitValue: "",
+    truePriority: "",
+    reSelection: ""
+  };
+
+  const lines = text.split(/\r?\n/).map(s => s.trim());
+
+  lines.forEach(line => {
+    if (/選択行動/i.test(line)) obj.selectedAction = line.replace(/選択行動[:：]/i, '').trim();
+    if (/明示理由/i.test(line)) obj.explicitReason = line.replace(/明示理由[:：]/i, '').trim();
+    if (/暗黙価値/i.test(line)) obj.implicitValue = line.replace(/暗黙価値[:：]/i, '').trim();
+    if (/優先ポイント/i.test(line)) obj.truePriority = line.replace(/優先ポイント[:：]/i, '').trim();
+    if (/再選択/i.test(line)) obj.reSelection = line.replace(/再選択[:：]/i, '').trim();
+  });
+
+  return obj;
+}
+
+/************************************************************
+ * PART 16: Day12 保存処理（感情・文脈・意味・守りたい価値・ラベル）
+ *  - 受信テキスト例：
+ *    #Day12 感情:〇〇 文脈:△△ 意味:□□ 価値:☆☆ ラベル:★★
+ ************************************************************/
+function processDay12Answer(userId, text) {
+  try {
+    // ---------------------------------------------------------
+    // ① テキストから「5つの要素」を抽出（Day12用）
+    // ---------------------------------------------------------
+    const emotionLabel     = extractNamedValue(text, '感情');
+    const emotionContext   = extractNamedValue(text, '文脈');
+    const emotionalMeaning = extractNamedValue(text, '意味');
+    const protectedValue   = extractNamedValue(text, '価値');
+    const emotionTagName   = extractNamedValue(text, 'ラベル');
+
+    // ---------------------------------------------------------
+    // ② スプレッドシートの行を探す
+    // ---------------------------------------------------------
+    const sheet = SpreadsheetApp.openById(PROP.SSID).getSheetByName(PROP.SHEET_NAME);
+    const row   = findUserRow(sheet, userId);
+    if (!row) {
+      logErr('processDay12Answer', 'user row not found');
+      return;
+    }
+
+    // ---------------------------------------------------------
+    // ③ Day12 の各項目を保存
+    //     ※COL_AS などは PART 0 の定数
+    // ---------------------------------------------------------
+    sheet.getRange(row, COL_AS).setValue(emotionLabel);
+    sheet.getRange(row, COL_AT).setValue(emotionContext);
+    sheet.getRange(row, COL_AU).setValue(emotionalMeaning);
+    sheet.getRange(row, COL_AV).setValue(protectedValue);
+    sheet.getRange(row, COL_AW).setValue(emotionTagName);
+
+    // ---------------------------------------------------------
+    // ④ ユーザーに返信
+    // ---------------------------------------------------------
+    const reply = 
+      `Day12の回答を受け取りました。\n` +
+      `感情: ${emotionLabel}\n` +
+      `文脈: ${emotionContext}\n` +
+      `保存が完了しました。`;
+
+    linePushText(userId, reply);
+
+  } catch (e) {
+    logErr('processDay12Answer', e);
+  }
+}
+
+/************************************************************
+ * PART 17: Day13 保存処理（思考パターン・起点場面・意味づけ・強化経緯・現在の解釈）
+ *   受信形式（例）：
+ *   #Day13 パターン:〇〇 起点:△△ 意味:□□ 強化:☆☆ 現在:★★
+ ************************************************************/
+function processDay13Answer(userId, text) {
+  try {
+    // ① 必要5項目を抽出
+    const pattern        = extractNamedValue(text, 'パターン');
+    const originScene    = extractNamedValue(text, '起点');
+    const originalMeaning = extractNamedValue(text, '意味');
+    const reinforceFlow  = extractNamedValue(text, '強化');
+    const currentInterpret = extractNamedValue(text, '現在');
+
+    // ② 行取得
+    const sheet = SpreadsheetApp.openById(PROP.SSID).getSheetByName(PROP.SHEET_NAME);
+    const row   = findUserRow(sheet, userId);
+    if (!row) {
+      logErr('processDay13Answer', 'user row not found');
+      return;
+    }
+
+    // ③ 保存（COL は PART 0 の定数）
+    sheet.getRange(row, COL.DAY13_PATTERN).setValue(pattern);
+    sheet.getRange(row, COL.DAY13_ORIGIN).setValue(originScene);
+    sheet.getRange(row, COL.DAY13_ORIGINAL_MEAN).setValue(originalMeaning);
+    sheet.getRange(row, COL.DAY13_REINFORCE).setValue(reinforceFlow);
+    sheet.getRange(row, COL.DAY13_CURRENT).setValue(currentInterpret);
+
+    // ④ 返信
+    const reply =
+      `Day13の回答を保存しました。\n` +
+      `パターン: ${pattern}\n` +
+      `起点: ${originScene}\n` +
+      `保存が完了しました。`;
+
+    linePushText(userId, reply);
+
+  } catch (e) {
+    logErr('processDay13Answer', e);
+  }
+}
+/************************************************************
+ * PART 18: Day14 保存処理（理想の構造）
+ *  - 受信テキスト例：
+ *    #Day14 理想:〇〇 行動:△△ 背景:□□ 感情:☆☆
+ ************************************************************/
+function processDay14Answer(userId, text) {
+  try {
+    const sheet = SpreadsheetApp.openById(SPREADSHEET_ID).getSheetByName(SHEET_NAME);
+    const row   = findUserRow(sheet, userId);
+    if (!row) return;
+
+    // ① パース処理
+    // ------------------------------------------------------------
+    const data = parseDay14Text_(text); // { ideal, action, background, emotion }
+
+    // ② スプレッドシート保存
+    // ------------------------------------------------------------
+    // ※列番号はあなたのシート構成に合わせて修正済み
+    sheet.getRange(row, COL_DAY14_IDEAL).setValue(data.ideal);
+    sheet.getRange(row, COL_DAY14_ACTION).setValue(data.action);
+    sheet.getRange(row, COL_DAY14_BACKGROUND).setValue(data.background);
+    sheet.getRange(row, COL_DAY14_EMOTION).setValue(data.emotion);
+
+    // ③ LINE返信
+    // ------------------------------------------------------------
+    replyToUser(userId, "Day14の回答を受け取りました。ありがとうございます。");
+
+  } catch (e) {
+    Logger.log("❌ processDay14Answer Error: " + e);
+  }
+}
+
+
+/************************************************************
+ * Day14 専用パーサー
+ ************************************************************/
+function parseDay14Text_(text) {
+  // 例：#Day14 理想:〇〇 行動:△△ 背景:□□ 感情:☆☆
+
+  const ideal      = extractAfterLabel_(text, "理想");
+  const action     = extractAfterLabel_(text, "行動");
+  const background = extractAfterLabel_(text, "背景");
+  const emotion    = extractAfterLabel_(text, "感情");
+
+  return {
+    ideal:      ideal,
+    action:     action,
+    background: background,
+    emotion:    emotion
+  };
+}
+/************************************************************
+ * PART 19: Day15 保存処理（行動の理由・欲求・根底ニーズ）
+ ************************************************************/
+function processDay15Answer(userId, text) {
+  try {
+    // ① ユーザー行取得
+    const sheet = SpreadsheetApp.openById(SPREADSHEET_ID).getSheetByName(SHEET_NAME);
+    const userRow = findUserRow(sheet, userId);
+    if (!userRow) {
+      replyToUser(userId, "ユーザー情報が見つかりませんでした。");
+      return;
+    }
+
+    // ② 内容抽出
+    // 形式：#Day15 理由:〇〇 欲求:△△ ニーズ:□□
+    const reason = extractAfter(text, "理由:");
+    const desire = extractAfter(text, "欲求:");
+    const need   = extractAfter(text, "ニーズ:");
+
+    // ③ スプレッドシート列定義
+    const COL_DAY15_REASON = 44; // 理由
+    const COL_DAY15_DESIRE = 45; // 欲求
+    const COL_DAY15_NEED   = 46; // 根底ニーズ
+
+    // ④ シート書き込み
+    sheet.getRange(userRow, COL_DAY15_REASON).setValue(reason);
+    sheet.getRange(userRow, COL_DAY15_DESIRE).setValue(desire);
+    sheet.getRange(userRow, COL_DAY15_NEED).setValue(need);
+
+    // ⑤ LINE返信
+    replyToUser(userId, "受け取りました");
+
+  } catch (error) {
+    Logger.log(`❌ Day15 エラー: ${error}`);
+    replyToUser(userId, "エラーが発生しました。");
+  }
+}
+
+/************************************************************
+ * テキスト抽出の共通関数（再掲）
+ ************************************************************/
+function extractAfter(text, key) {
+  if (!text || !key) return "";
+  const idx = text.indexOf(key);
+  if (idx === -1) return "";
+  return text.substring(idx + key.length).split(" ")[0].trim();
+}
+
+/************************************************************
+ * PART 20: Day16 保存処理（行動レシピの構造化）
+ ************************************************************/
+function processDay16Answer(userId, text) {
+  try {
+    const sheet = getUserSheet();
+    const row   = findUserRow(sheet, userId);
+    if (!row) {
+      logErr("processDay16Answer", "user row not found");
+      return;
+    }
+
+    // --------------------------------------------
+    // ① テキスト解析（#Day16 … を除去して ｜ で分割）
+    //  フォーマット:
+    //   よかった体験｜行動の手順｜実行しやすい要因｜使いたい場面
+    // --------------------------------------------
+    const raw   = text.replace(/^#Day16\s*/i, "").trim();
+    const parts = raw.split("｜");
+
+    const goodExp   = parts[0] || "";
+    const steps     = parts[1] || "";
+    const factors   = parts[2] || "";
+    const context   = parts[3] || "";
+
+    // --------------------------------------------
+    // ② 保存（COL は PART 0 の定数）
+    // --------------------------------------------
+    sheet.getRange(row, getColIndex(COL.DAY16_GOOD_EXP)).setValue(goodExp);
+    sheet.getRange(row, getColIndex(COL.DAY16_STEPS)).setValue(steps);
+    sheet.getRange(row, getColIndex(COL.DAY16_FACTORS)).setValue(factors);
+    sheet.getRange(row, getColIndex(COL.DAY16_CONTEXT)).setValue(context);
+
+    // --------------------------------------------
+    // ③ 返信
+    // --------------------------------------------
+    const reply =
+      "Day16 の記録を受け取りました📘\n" +
+      "行動レシピが構造化されました。明日以降の再現性が高まります。";
+
+    replyToUser(userId, reply);
+
+  } catch (e) {
+    logErr("processDay16Answer", e);
+  }
+}
+/************************************************************
+ * PART 21: Day17 保存処理（回答＋点数）
+ ************************************************************/
+function processDay17Answer(userId, userText) {
+  try {
+    const sheet = getNoubitoSheet_();
+    const row   = findUserRow_(sheet, userId);
+    if (!row) return;
+
+    const answer = userText.replace(/^#?Day17/i, '').trim();
+    if (!answer) return;
+
+    // 採点
+    const score = evaluateDay17Score_(answer);
+
+    // 保存（BU：回答 / BT：点数）
+    sheet.getRange(row, COL_MAP.Day17_回答).setValue(answer);
+    sheet.getRange(row, COL_MAP.Day17_点数).setValue(score);
+
+    replyToUser_(userId, "Day17の回答、受け取りました。");
+
+  } catch (e) {
+    Logger.log("❌ processDay17Answer Error: " + e);
+  }
+}
+/************************************************************
+ * PART 22: Day17 採点ロジック
+ ************************************************************/
+function evaluateDay17Score_(answer) {
+  const len = answer.length;
+  if (len >= 80) return 5;
+  if (len >= 50) return 4;
+  if (len >= 30) return 3;
+  if (len >= 10) return 2;
+  return 1;
+}
+/************************************************************
+ * PART 23: Day18 保存処理（回答＋点数）
+ *  - 受信例：#Day18 ○○○
+ *  - 保存先：BU（回答） / BV（点数）
+ ************************************************************/
+function processDay18Answer(userId, userText) {
+  try {
+    const sheet = getNoubitoSheet_();
+    const row   = findUserRow_(sheet, userId);
+    if (!row) return;
+
+    // 回答抽出
+    const answer = userText.replace(/^#?Day18/i, '').trim();
+    if (!answer) return;
+
+    // 点数（採点ロジックは別関数）
+    const score = evaluateDay18Score_(answer);
+
+    // 保存
+    sheet.getRange(row, COL_MAP.Day18_回答).setValue(answer);
+    sheet.getRange(row, COL_MAP.Day18_点数).setValue(score);
+
+    // LINE返信
+    replyToUser_(userId, "Day18の回答、受け取りました。");
+
+  } catch (e) {
+    Logger.log("❌ processDay18Answer Error: " + e);
+  }
+}
+
+/************************************************************
+ * PART 23-2: Day18 採点ロジック
+ ************************************************************/
+function evaluateDay18Score_(answer) {
+  // 例：文字数でスコアリング（必要なら自由に変更OK）
+  const len = answer.length;
+
+  if (len >= 80) return 5;
+  if (len >= 50) return 4;
+  if (len >= 30) return 3;
+  if (len >= 10) return 2;
+  return 1;
+}
+/************************************************************
+ * PART 23: Day18 保存処理（回答＋点数）
+ *  - 受信例：#Day18 ○○○
+ *  - 保存先：BU（回答） / BV（点数）
+ ************************************************************/
+function processDay18Answer(userId, userText) {
+  try {
+    const sheet = getNoubitoSheet_();
+    const row   = findUserRow_(sheet, userId);
+    if (!row) return;
+
+    // 回答抽出
+    const answer = userText.replace(/^#?Day18/i, '').trim();
+    if (!answer) return;
+
+    // 採点
+    const score = evaluateDay18Score_(answer);
+
+    // 保存
+    sheet.getRange(row, COL_MAP.Day18_回答).setValue(answer);
+    sheet.getRange(row, COL_MAP.Day18_点数).setValue(score);
+
+    // LINE返信
+    replyToUser_(userId, "Day18の回答、受け取りました。");
+
+  } catch (e) {
+    Logger.log("❌ processDay18Answer Error: " + e);
+  }
+}
+
+
+/************************************************************
+ * PART 24: Day18 採点ロジック
+ ************************************************************/
+function evaluateDay18Score_(answer) {
+  const len = answer.length;
+  if (len >= 80) return 5;
+  if (len >= 50) return 4;
+  if (len >= 30) return 3;
+  if (len >= 10) return 2;
+  return 1;
+}
+/************************************************************
+ * PART 25: Day19 保存処理（回答＋点数）
+ *  - 受信例：#Day19 ○○○
+ *  - 保存先：BW（回答） / BX（点数）
+ ************************************************************/
+function processDay19Answer(userId, userText) {
+  try {
+    const sheet = getNoubitoSheet_();
+    const row   = findUserRow_(sheet, userId);
+    if (!row) return;
+
+    // 回答抽出
+    const answer = userText.replace(/^#?Day19/i, '').trim();
+    if (!answer) return;
+
+    // 採点
+    const score = evaluateDay19Score_(answer);
+
+    // 保存
+    sheet.getRange(row, COL_MAP.Day19_回答).setValue(answer);
+    sheet.getRange(row, COL_MAP.Day19_点数).setValue(score);
+
+    // LINE返信
+    replyToUser_(userId, "Day19の回答、受け取りました。");
+
+  } catch (e) {
+    Logger.log("❌ processDay19Answer Error: " + e);
+  }
+}
+
+
+/************************************************************
+ * PART 26: Day19 採点ロジック
+ ************************************************************/
+function evaluateDay19Score_(answer) {
+  const len = answer.length;
+  if (len >= 80) return 5;
+  if (len >= 50) return 4;
+  if (len >= 30) return 3;
+  if (len >= 10) return 2;
+  return 1;
+}
+/************************************************************
+ * PART 27: Day20 保存処理（回答＋点数）
+ *  - 受信例：#Day20 ○○○
+ *  - 保存先：BY（回答） / BZ（点数）
+ ************************************************************/
+function processDay20Answer(userId, userText) {
+  try {
+    const sheet = getNoubitoSheet_();
+    const row   = findUserRow_(sheet, userId);
+    if (!row) return;
+
+    // 回答抽出
+    const answer = userText.replace(/^#?Day20/i, '').trim();
+    if (!answer) return;
+
+    // 点数（採点ロジックは下部の関数）
+    const score = evaluateDay20Score_(answer);
+
+    // 保存（回答：BY / 点数：BZ）
+    sheet.getRange(row, COL_MAP.Day20_回答).setValue(answer);
+    sheet.getRange(row, COL_MAP.Day20_点数).setValue(score);
+
+    // LINE返信（Day20はDay17〜20と同じ形式：受取＋点数）
+    replyToUser_(userId, `Day20の回答を受け取りました。\n点数：${score} 点`);
+
+  } catch (e) {
+    Logger.log("❌ processDay20Answer Error: " + e);
+  }
+}
+/************************************************************
+ * PART 28: Day20 採点ロジック
+ ************************************************************/
+function evaluateDay20Score_(answer) {
+  const len = answer.length;
+  if (len >= 80) return 5;
+  if (len >= 50) return 4;
+  if (len >= 30) return 3;
+  if (len >= 10) return 2;
+  return 1;
+}
+
+/************************************************************
+ * PART 29: Day21 保存処理（内的コンパス）
+ ************************************************************/
+function processDay21Answer(userId, text) {
+  try {
+    const sheet = getMainSheet_();
+    const row   = findUserRow_(sheet, userId);
+    if (!row) return;
+
+    // フォーマット： #Day21 価値観｜場面｜理想｜問い｜コンパス
+    const raw   = text.replace(/^#?Day21/i, "").trim();
+    const parts = raw.split("｜");
+
+    const coreValues       = parts[0] || "";
+    const embodimentScene  = parts[1] || "";
+    const idealStance      = parts[2] || "";
+    const selfPrompt       = parts[3] || "";
+    const actionCompass    = parts[4] || "";
+
+    sheet.getRange(row, getColIndex("CA")).setValue(coreValues);
+    sheet.getRange(row, getColIndex("CB")).setValue(embodimentScene);
+    sheet.getRange(row, getColIndex("CC")).setValue(idealStance);
+    sheet.getRange(row, getColIndex("CD")).setValue(selfPrompt);
+    sheet.getRange(row, getColIndex("CE")).setValue(actionCompass);
+
+    replyToUser_(userId, "Day21 の回答を受け取りました。");
+
+  } catch (e) {
+    logErr("processDay21Answer", e);
+  }
+}
+/************************************************************
+ * PART 30: Day22 保存処理（選択と責任）
+ ************************************************************/
+function processDay22Answer(userId, text) {
+  try {
+    const sheet = getMainSheet_();
+    const row   = findUserRow_(sheet, userId);
+    if (!row) return;
+
+    // #Day22 選択場面｜理由｜選択？｜実際の選択肢｜新しい選択
+    const raw   = text.replace(/^#?Day22/i, "").trim();
+    const parts = raw.split("｜");
+
+    const scene      = parts[0] || "";
+    const avoided    = parts[1] || "";
+    const ownership  = parts[2] || "";
+    const options    = parts[3] || "";
+    const newChoice  = parts[4] || "";
+
+    sheet.getRange(row, getColIndex("CF")).setValue(scene);
+    sheet.getRange(row, getColIndex("CG")).setValue(avoided);
+    sheet.getRange(row, getColIndex("CH")).setValue(ownership);
+    sheet.getRange(row, getColIndex("CI")).setValue(options);
+    sheet.getRange(row, getColIndex("CJ")).setValue(newChoice);
+
+    replyToUser_(userId, "Day22 の回答を受け取りました。");
+
+  } catch (e) {
+    logErr("processDay22Answer", e);
+  }
+}
+/************************************************************
+ * PART 31: Day23 保存処理（葛藤と統合）
+ ************************************************************/
+function processDay23Answer(userId, text) {
+  try {
+    const sheet = getMainSheet_();
+    const row   = findUserRow_(sheet, userId);
+    if (!row) return;
+
+    // #Day23 テーマ｜声A｜声B｜願いA｜願いB｜両立案｜仮選択
+    const raw   = text.replace(/^#?Day23/i, "").trim();
+    const parts = raw.split("｜");
+
+    const theme   = parts[0] || "";
+    const voiceA  = parts[1] || "";
+    const voiceB  = parts[2] || "";
+    const wishA   = parts[3] || "";
+    const wishB   = parts[4] || "";
+    const options = parts[5] || "";
+    const choice  = parts[6] || "";
+
+    sheet.getRange(row, getColIndex("CK")).setValue(theme);
+    sheet.getRange(row, getColIndex("CL")).setValue(voiceA);
+    sheet.getRange(row, getColIndex("CM")).setValue(voiceB);
+    sheet.getRange(row, getColIndex("CN")).setValue(wishA);
+    sheet.getRange(row, getColIndex("CO")).setValue(wishB);
+    sheet.getRange(row, getColIndex("CP")).setValue(options);
+    sheet.getRange(row, getColIndex("CQ")).setValue(choice);
+
+    replyToUser_(userId, "Day23 の回答を受け取りました。");
+
+  } catch (e) {
+    logErr("processDay23Answer", e);
+  }
+}
+/************************************************************
+ * PART 32: Day24 保存処理（姿勢の言語化）
+ ************************************************************/
+function processDay24Answer(userId, text) {
+  try {
+    const sheet = getMainSheet_();
+    const row   = findUserRow_(sheet, userId);
+    if (!row) return;
+
+    // #Day24 行動対象｜姿勢｜理由｜一言
+    const raw   = text.replace(/^#?Day24/i, "").trim();
+    const parts = raw.split("｜");
+
+    const target    = parts[0] || "";
+    const stance    = parts[1] || "";
+    const reason    = parts[2] || "";
+    const phrase    = parts[3] || "";
+
+    sheet.getRange(row, getColIndex("CR")).setValue(target);
+    sheet.getRange(row, getColIndex("CS")).setValue(stance);
+    sheet.getRange(row, getColIndex("CT")).setValue(reason);
+    sheet.getRange(row, getColIndex("CU")).setValue(phrase);
+
+    replyToUser_(userId, "Day24 の回答を受け取りました。");
+
+  } catch (e) {
+    logErr("processDay24Answer", e);
+  }
+}
+/************************************************************
+ * PART 33: Day25 保存処理（再接続フィードバック）
+ *  - 受信例：
+ *    #Day25 実施:○○ 印象:△△ 姿勢:□□ 気づき:☆☆ 再接続:★★
+ ************************************************************/
+function processDay25Answer(userId, text) {
+  try {
+    const sheet = getNoubitoSheet_();
+    const row   = findUserRow_(sheet, userId);
+    if (!row) return;
+
+    // -------------------------------
+    // ① 要素抽出
+    // -------------------------------
+    const status    = extractNamedValue(text, '実施');      // 実施状況
+    const impression = extractNamedValue(text, '印象');     // 行動中の印象・感情
+    const stance     = extractNamedValue(text, '姿勢');     // 姿勢が保てたか
+    const awareness  = extractNamedValue(text, '気づき');   // ズレ／一致の気づき
+    const reconnect  = extractNamedValue(text, '再接続');   // 再接続のひとこと
+
+    // -------------------------------
+    // ② 保存
+    // -------------------------------
+    sheet.getRange(row, COL_MAP.Day25_実施状況).setValue(status);
+    sheet.getRange(row, COL_MAP.Day25_印象).setValue(impression);
+    sheet.getRange(row, COL_MAP.Day25_姿勢反省).setValue(stance);
+    sheet.getRange(row, COL_MAP.Day25_気づき).setValue(awareness);
+    sheet.getRange(row, COL_MAP.Day25_再接続).setValue(reconnect);
+
+    // -------------------------------
+    // ③ 返信
+    // -------------------------------
+    const reply =
+      "Day25 の回答を受け取りました。\n" +
+      "価値観と姿勢のふりかえり、保存完了です。";
+
+    replyToUser_(userId, reply);
+
+  } catch (e) {
+    logErr("processDay25Answer", e);
+  }
+}
+/************************************************************
+ * PART 33: Day25 保存処理（再接続とフィードバック）
+ ************************************************************/
+function processDay25Answer(userId, text) {
+  try {
+    const sheet = getNoubitoSheet_();
+    const row   = findUserRow_(sheet, userId);
+    if (!row) return;
+
+    // --- Day25：5項目抽出 --------------------
+    const completed    = extractNamedValue(text, "実施状況");
+    const impression   = extractNamedValue(text, "印象");
+    const stanceKeep   = extractNamedValue(text, "姿勢");
+    const awareness    = extractNamedValue(text, "気づき");
+    const reconnectOne = extractNamedValue(text, "一言");
+
+    // --- 保存（あなたの列構成に合わせる） ---
+    sheet.getRange(row, COL_MAP.Day25_実施状況).setValue(completed);
+    sheet.getRange(row, COL_MAP.Day25_印象).setValue(impression);
+    sheet.getRange(row, COL_MAP.Day25_姿勢の継続).setValue(stanceKeep);
+    sheet.getRange(row, COL_MAP.Day25_気づき).setValue(awareness);
+    sheet.getRange(row, COL_MAP.Day25_再接続フレーズ).setValue(reconnectOne);
+
+    replyToUser_(userId, "Day25の回答を記録しました。");
+  } catch (e) {
+    Logger.log("❌ processDay25Answer error: " + e);
+  }
+}
+/************************************************************
+ * PART 34: Day26 保存処理（他者への影響）
+ ************************************************************/
+function processDay26Answer(userId, text) {
+  try {
+    const sheet = getNoubitoSheet_();
+    const row   = findUserRow_(sheet, userId);
+    if (!row) return;
+
+    const highlight   = extractNamedValue(text, "やり取り");
+    const selfStance  = extractNamedValue(text, "姿勢");
+    const impact      = extractNamedValue(text, "影響");
+    const connection  = extractNamedValue(text, "つながり");
+    const nextIntent  = extractNamedValue(text, "次");
+
+    sheet.getRange(row, COL_MAP.Day26_やり取り).setValue(highlight);
+    sheet.getRange(row, COL_MAP.Day26_姿勢).setValue(selfStance);
+    sheet.getRange(row, COL_MAP.Day26_影響).setValue(impact);
+    sheet.getRange(row, COL_MAP.Day26_つながり).setValue(connection);
+    sheet.getRange(row, COL_MAP.Day26_次の意図).setValue(nextIntent);
+
+    replyToUser_(userId, "Day26の回答を記録しました。");
+  } catch (e) {
+    Logger.log("❌ processDay26Answer error: " + e);
+  }
+}
+/************************************************************
+ * PART 35: Day27 保存処理（選択パターンの再設計）
+ ************************************************************/
+function processDay27Answer(userId, text) {
+  try {
+    const sheet = getNoubitoSheet_();
+    const row   = findUserRow_(sheet, userId);
+    if (!row) return;
+
+    const pattern   = extractNamedValue(text, "パターン");
+    const trigger   = extractNamedValue(text, "きっかけ");
+    const chain     = extractNamedValue(text, "連鎖");
+    const alternate = extractNamedValue(text, "代替");
+    const redesign  = extractNamedValue(text, "一手");
+
+    sheet.getRange(row, COL_MAP.Day27_パターン).setValue(pattern);
+    sheet.getRange(row, COL_MAP.Day27_きっかけ).setValue(trigger);
+    sheet.getRange(row, COL_MAP.Day27_連鎖).setValue(chain);
+    sheet.getRange(row, COL_MAP.Day27_代替案).setValue(alternate);
+    sheet.getRange(row, COL_MAP.Day27_再設計).setValue(redesign);
+
+    replyToUser_(userId, "Day27の回答を記録しました。");
+  } catch (e) {
+    Logger.log("❌ processDay27Answer error: " + e);
+  }
+}
+/************************************************************
+ * PART 36: Day28 保存処理（セルフトークの再定義）
+ ************************************************************/
+function processDay28Answer(userId, text) {
+  try {
+    const sheet = getNoubitoSheet_();
+    const row   = findUserRow_(sheet, userId);
+    if (!row) return;
+
+    const phrase     = extractNamedValue(text, "セルフトーク");
+    const context    = extractNamedValue(text, "場面");
+    const influence  = extractNamedValue(text, "影響");
+    const redefine   = extractNamedValue(text, "言い換え");
+    const preferred  = extractNamedValue(text, "使いたい言葉");
+
+    sheet.getRange(row, COL_MAP.Day28_セルフトーク).setValue(phrase);
+    sheet.getRange(row, COL_MAP.Day28_場面).setValue(context);
+    sheet.getRange(row, COL_MAP.Day28_影響).setValue(influence);
+    sheet.getRange(row, COL_MAP.Day28_言い換え).setValue(redefine);
+    sheet.getRange(row, COL_MAP.Day28_使いたい言葉).setValue(preferred);
+
+    replyToUser_(userId, "Day28の回答を記録しました。");
+  } catch (e) {
+    Logger.log("❌ processDay28Answer error: " + e);
+  }
+}
+/************************************************************
+ * PART 37: Day29 保存処理（選択のルール）
+ ************************************************************/
+function processDay29Answer(userId, text) {
+  try {
+    const sheet = getNoubitoSheet_();
+    const row   = findUserRow_(sheet, userId);
+    if (!row) return;
+
+    const scene   = extractNamedValue(text, "場面");
+    const criteria= extractNamedValue(text, "基準");
+    const origin  = extractNamedValue(text, "起源");
+    const evalNow = extractNamedValue(text, "今の評価");
+    const axis    = extractNamedValue(text, "選択軸");
+
+    sheet.getRange(row, COL_MAP.Day29_場面).setValue(scene);
+    sheet.getRange(row, COL_MAP.Day29_基準).setValue(criteria);
+    sheet.getRange(row, COL_MAP.Day29_起源).setValue(origin);
+    sheet.getRange(row, COL_MAP.Day29_評価).setValue(evalNow);
+    sheet.getRange(row, COL_MAP.Day29_選択軸).setValue(axis);
+
+    replyToUser_(userId, "Day29の回答を記録しました。");
+  } catch (e) {
+    Logger.log("❌ processDay29Answer error: " + e);
+  }
+}
+/************************************************************
+ * PART 38: Day30 保存処理（差分と現在地）
+ ************************************************************/
+function processDay30Answer(userId, text) {
+  try {
+    const sheet = getNoubitoSheet_();
+    const row   = findUserRow_(sheet, userId);
+    if (!row) return;
+
+    const initObs   = extractNamedValue(text, "初期現象");
+    const change    = extractNamedValue(text, "変化");
+    const memorable = extractNamedValue(text, "印象的なDay");
+    const nowSelf   = extractNamedValue(text, "今の自分");
+    const title     = extractNamedValue(text, "タイトル");
+
+    sheet.getRange(row, COL_MAP.Day30_初期現象).setValue(initObs);
+    sheet.getRange(row, COL_MAP.Day30_変化).setValue(change);
+    sheet.getRange(row, COL_MAP.Day30_印象的).setValue(memorable);
+    sheet.getRange(row, COL_MAP.Day30_現在の自分).setValue(nowSelf);
+    sheet.getRange(row, COL_MAP.Day30_タイトル).setValue(title);
+
+    replyToUser_(userId, "Day30の回答を記録しました。");
+  } catch (e) {
+    Logger.log("❌ processDay30Answer error: " + e);
+  }
+}
+/************************************************************
+ * PART 39: Day25〜30 のルーティング処理
+ *  受信した LINE メッセージから Day を判定して
+ *  各 Day の保存処理へ振り分ける
+ ************************************************************/
+function routeDay25to30_(userId, text) {
+
+  // 空白除去
+  const t = text.trim();
+
+  // Day25
+  if (/^#?Day25/i.test(t)) {
+    processDay25Answer(userId, t);
+    return true;
+  }
+
+  // Day26
+  if (/^#?Day26/i.test(t)) {
+    processDay26Answer(userId, t);
+    return true;
+  }
+
+  // Day27
+  if (/^#?Day27/i.test(t)) {
+    processDay27Answer(userId, t);
+    return true;
+  }
+
+  // Day28
+  if (/^#?Day28/i.test(t)) {
+    processDay28Answer(userId, t);
+    return true;
+  }
+
+  // Day29
+  if (/^#?Day29/i.test(t)) {
+    processDay29Answer(userId, t);
+    return true;
+  }
+
+  // Day30
+  if (/^#?Day30/i.test(t)) {
+    processDay30Answer(userId, t);
+    return true;
+  }
+
+  return false; // いずれでもない
+}
+/************************************************************
+ * PART 40: Day25〜30 ルーティング（完成版）
+ ************************************************************/
+function routeDay25to30_(userId, text) {
+  try {
+    if (!userId || !text) return false;
+
+    // 全角→半角整形・空白除去
+    const t = String(text).replace(/\u3000/g, " ").trim();
+
+    // -------------------------
+    // Day25
+    // -------------------------
+    if (/^#?Day25\b/i.test(t)) {
+      if (typeof processDay25Answer === "function") {
+        processDay25Answer(userId, t);
+      }
+      return true;
+    }
+
+    // -------------------------
+    // Day26
+    // -------------------------
+    if (/^#?Day26\b/i.test(t)) {
+      if (typeof processDay26Answer === "function") {
+        processDay26Answer(userId, t);
+      }
+      return true;
+    }
+
+    // -------------------------
+    // Day27
+    // -------------------------
+    if (/^#?Day27\b/i.test(t)) {
+      if (typeof processDay27Answer === "function") {
+        processDay27Answer(userId, t);
+      }
+      return true;
+    }
+
+    // -------------------------
+    // Day28
+    // -------------------------
+    if (/^#?Day28\b/i.test(t)) {
+      if (typeof processDay28Answer === "function") {
+        processDay28Answer(userId, t);
+      }
+      return true;
+    }
+
+    // -------------------------
+    // Day29
+    // -------------------------
+    if (/^#?Day29\b/i.test(t)) {
+      if (typeof processDay29Answer === "function") {
+        processDay29Answer(userId, t);
+      }
+      return true;
+    }
+
+    // -------------------------
+    // Day30
+    // -------------------------
+    if (/^#?Day30\b/i.test(t)) {
+      if (typeof processDay30Answer === "function") {
+        processDay30Answer(userId, t);
+      }
+      return true;
+    }
+
+    // -------------------------
+    // どれでもない
+    // -------------------------
+    return false;
+
+  } catch (err) {
+    logErr("routeDay25to30_", err);
+    return false;
+  }
+}
+
+
+/************************************************************
+ * 70. generateOsPatternPrompt
+ * Day17〜29 + 個人属性（MBTI/出生年/職業）から
+ * OSパターン名称・説明を生成するGPTプロンプトを構築
+ ************************************************************/
+function generateOsPatternPrompt(userData) {
+  return `
+あなたは「認知OS分析（Noubito）」の専門家です。
+
+### 【目的】
+ユーザーの思考・反応・行動のパターンを、
+MBTIや既存の分類ではなく、
+本人の思考OSを表す「OSパターン」として命名し、
+説明文を作成してください。
+
+### 【OSパターンの定義】
+- INTP/ENFPなどのMBTI名称は禁止
+- 無料診断のテンプレ禁止
+- “構造先行型”“整合性駆動”など OSの動き方を表す命名にする
+- 一般名詞＋OS特性で構成する（例：構造先行型、意味探索型、未来投影OSなど）
+
+### 【ユーザー情報】
+MBTI：${userData.mbti || "未入力"}
+出生年：${userData.birthYear || "未入力"}
+職業：${userData.occupation || "未入力"}
+
+### 【Day17〜29のデータ】
+${JSON.stringify(userData.dayData, null, 2)}
+
+### 【出力仕様】
+以下のJSON形式で返してください：
+
+{
+  "osPatternName": "（タイプ名・短い）",
+  "osPatternDescription": "（OSの動作原理・思考傾向・反応特性を200〜300文字で説明）"
+}
+
+日本語で書くこと。
+    `;
+}
+/************************************************************
+ * 71. fetchOsPatternFromGPT
+ * OSパターン名＋OSパターン説明をGPTから取得
+ ************************************************************/
+function fetchOsPatternFromGPT(prompt) {
+  const apiKey = PropertiesService.getScriptProperties().getProperty('OPENAI_API_KEY');
+  const url = "https://api.openai.com/v1/chat/completions";
+
+  const payload = {
+    model: "gpt-4o-mini",
+    messages: [
+      { role: "system", content: "You are a cognitive OS analyst." },
+      { role: "user", content: prompt }
+    ],
+    temperature: 0.6,
+  };
+
+  const options = {
+    method: "post",
+    contentType: "application/json",
+    headers: { Authorization: "Bearer " + apiKey },
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true
+  };
+
+  const response = UrlFetchApp.fetch(url, options);
+  const json = JSON.parse(response.getContentText());
+  const content = json.choices?.[0]?.message?.content || "";
+
+  return content;
+}
+/************************************************************
+ * 72. parseOsPatternJson
+ * GPTが返した文字列から JSON を抽出して返す
+ ************************************************************/
+function parseOsPatternJson(gptText) {
+  try {
+    const match = gptText.match(/\{[\s\S]*\}/);
+    if (!match) throw new Error("JSONが見つかりません");
+    return JSON.parse(match[0]);
+  } catch (e) {
+    Logger.log("❌ OSパターン JSON抽出エラー: " + e);
+    return {
+      osPatternName: "構造パターン",
+      osPatternDescription: "OSパターンの抽出に失敗したため、デフォルト値を返します。"
+    };
+  }
+}
+/************************************************************
+ * 73. buildOsPatternForDay30
+ * Day30レポート用の OSパターン（名称＋説明）を一括生成
+ ************************************************************/
+function buildOsPatternForDay30(userData) {
+
+  // 1. プロンプト構築
+  const prompt = generateOsPatternPrompt(userData);
+
+  // 2. GPT呼び出し
+  const gptResponse = fetchOsPatternFromGPT(prompt);
+
+  // 3. JSON抽出
+  const parsed = parseOsPatternJson(gptResponse);
+
+  return {
+    osPatternName: parsed.osPatternName,
+    osPatternDescription: parsed.osPatternDescription
+  };
+}
+/************************************************************
+ * 74. generateDay30HtmlReport
+ * Day30レポートHTML（最終完全版）を生成する
+ ************************************************************/
+function generateDay30HtmlReport(reportData) {
+
+  // HTMLテンプレート読み込み
+  const templateFile = HtmlService.createTemplateFromFile('template_day30');
+
+  // ============ 1. 必須セクションを差し込み ============
+  templateFile.title                = reportData.title || "Noubito Day30 レポート";
+  templateFile.typeName             = reportData.typeName || "";
+  templateFile.typeDescription      = reportData.typeDescription || "";
+
+  templateFile.scoreSection         = reportData.scoreSection || "";
+  templateFile.dominantLayer        = reportData.dominantLayer || "";
+  templateFile.thinkingType         = reportData.thinkingType || "";
+
+  templateFile.conflictSection      = reportData.conflictSection || "";
+  templateFile.shiftSection         = reportData.shiftSection || "";
+  templateFile.valueFormingBackground = reportData.valueFormingBackground || "";
+  templateFile.finalTips            = reportData.finalTips || "";
+
+  // ============ 2. OSパターン（新規追加） ============
+  templateFile.osPatternName        = reportData.osPatternName || "";
+  templateFile.osPatternDescription = reportData.osPatternDescription || "";
+
+  // ============ 3. 図表（Base64） ============
+  templateFile.viewpointChartBase64 = reportData.viewpointChartBase64 || "";
+
+  // ============ 4. Preface / Outro ============
+  templateFile.prefaceHtml          = reportData.prefaceHtml || "";
+  templateFile.outroHtml            = reportData.outroHtml || "";
+
+  // ============ 5. Day24〜29 カードHTML ============
+  templateFile.cardsHtml            = reportData.cardsHtml || "";
+
+  // ============ 6. 最終的なHTML文字列にする ============
+  const html = templateFile.evaluate().getContent();
+  return html;
+}
+{
+  title: "",
+  typeName: "",
+  typeDescription: "",
+
+  scoreSection: "",
+  dominantLayer: "",
+  thinkingType: "",
+  conflictSection: "",
+  shiftSection: "",
+  valueFormingBackground: "",
+  finalTips: "",
+
+  osPatternName: "",
+  osPatternDescription: "",
+
+  viewpointChartBase64: "",
+  cardsHtml: "",
+  prefaceHtml: "",
+  outroHtml: ""
+}
+/************************************************************
+ * 25. createDay30PdfFromHtml
+ * HTML → PDF（スマホ縦長対応）を生成し、Driveに保存
+ * 戻り値：{ fileId, pdfBytes }
+ ************************************************************/
+function createDay30PdfFromHtml(htmlContent, userId) {
+
+  // 一時HTMLファイル作成
+  const tempHtml = HtmlService.createHtmlOutput(htmlContent)
+    .setTitle("Day30 Report")
+    .setSandboxMode(HtmlService.SandboxMode.IFRAME);
+
+  const blob = tempHtml.getBlob().setName("day30_temp.html");
+
+  // HTML → PDF 変換（puppeteer相当の内部GAS機能）
+  const pdfBlob = blob.getAs('application/pdf').setName("Day30_Report.pdf");
+
+  // ユーザー別フォルダに保存
+  const folder = getOrCreateDay30Folder(userId);
+  const file = folder.createFile(pdfBlob);
+
+  return {
+    fileId: file.getId(),
+    pdfBytes: pdfBlob.getBytes()
+  };
+}
+
+/************************************************************
+ * Day30用フォルダ取得（なければ作る）
+ ************************************************************/
+function getOrCreateDay30Folder(userId) {
+
+  const parentFolderId = PropertiesService.getScriptProperties()
+    .getProperty('DAY30_FOLDER_ROOT');
+
+  if (!parentFolderId) {
+    throw new Error("DAY30_FOLDER_ROOT が設定されていません");
+  }
+
+  const parent = DriveApp.getFolderById(parentFolderId);
+
+  // 既存フォルダ探す
+  const it = parent.getFoldersByName(userId);
+  if (it.hasNext()) return it.next();
+
+  // なければ生成
+  return parent.createFolder(userId);
+}
+/************************************************************
+ * 26. sendDay30ReportPdf
+ * LINEへPDFを送信（バイナリ送信 完全版）
+ ************************************************************/
+function sendDay30ReportPdf(userId, pdfBytes, fileName) {
+
+  const token = PropertiesService.getScriptProperties()
+    .getProperty("LINE_CHANNEL_TOKEN");
+
+  const url = "https://api.line.me/v2/bot/message/push";
+
+  const boundary = "LINE-PDF-BOUNDARY";
+  const data = Utilities.newBlob("", "multipart/form-data", "");
+
+  let body = "";
+  body += "--" + boundary + "\r\n";
+  body += "Content-Disposition: form-data; name=\"to\"\r\n\r\n";
+  body += userId + "\r\n";
+
+  body += "--" + boundary + "\r\n";
+  body += "Content-Disposition: form-data; name=\"messages\"; filename=\"payload.json\"\r\n";
+  body += "Content-Type: application/json\r\n\r\n";
+
+  const messageJson = JSON.stringify({
+    to: userId,
+    messages: [
+      {
+        type: "file",
+        fileName: fileName || "Day30_Report.pdf",
+        fileSize: pdfBytes.length
+      }
+    ]
+  });
+
+  body += messageJson + "\r\n";
+
+  body += "--" + boundary + "\r\n";
+  body += "Content-Disposition: form-data; name=\"file\"; filename=\"" + fileName + "\"\r\n";
+  body += "Content-Type: application/pdf\r\n\r\n";
+
+  const payloadBlob = Utilities.newBlob(
+    body,
+    "multipart/form-data; boundary=" + boundary
+  );
+
+  const pdfBlob = Utilities.newBlob(pdfBytes, "application/pdf", fileName);
+
+  const fullPayload = Utilities.newBlob(
+    payloadBlob.getBytes()
+      .concat(pdfBlob.getBytes())
+      .concat(Utilities.newBlob("\r\n--" + boundary + "--", "text/plain").getBytes())
+  );
+
+  const params = {
+    method: "post",
+    headers: { "Authorization": "Bearer " + token },
+    payload: fullPayload,
+    contentType: "multipart/form-data; boundary=" + boundary,
+    muteHttpExceptions: true,
+  };
+
+  const res = UrlFetchApp.fetch(url, params);
+  Logger.log("LINE送信結果: " + res.getContentText());
+
+  return res.getResponseCode();
+}
+/************************************************************
+ * 31. processDay30SummaryAnalysis（完成版）
+ *  Day24〜30 の全データを収集し、
+ *  OSパターン生成プロンプトを作成 → GPT解析
+ *  → HTML生成 → PDF生成 → LINE送信まで一括実行
+ ************************************************************/
+function processDay30SummaryAnalysis(userId) {
+  try {
+    const sheet = getNoubitoSheet_();
+    const row   = findUserRow_(sheet, userId);
+    if (!row) {
+      replyToUser_(userId, "ユーザー情報が見つかりません。");
+      return;
+    }
+
+    //----------------------------------------------------
+    // ① Day24〜29 の回答をすべて取得
+    //----------------------------------------------------
+    const dayData = getDay24to29Data_(sheet, row);   // 関数56
+    const day30   = getDay30Answer_(sheet, row);     // 関数57
+
+    //----------------------------------------------------
+    // ② 個人情報（MBTI・出生年など）取得
+    //----------------------------------------------------
+    const personal = getDay30PersonalInfo_(sheet, row); // MBTI, birthYear, occupation…
+    const valueFormingYear = personal.birthYear
+      ? Number(personal.birthYear) + 14
+      : "";
+
+    //----------------------------------------------------
+    // ③ GPTプロンプトを生成（OSパターン対応版）
+    //----------------------------------------------------
+    const prompt = generateOsPatternPrompt_({
+      day24to29: dayData,
+      day30: day30,
+      initialObservation: day30.initialObservation || "",
+      valueFormingYear: valueFormingYear,
+      userPersonalInfo: personal
+    });
+
+    //----------------------------------------------------
+    // ④ GPTへ送信 → OSパターン解析を取得
+    //----------------------------------------------------
+    const gptResponse = callChatGPTFromOpenAI(prompt, {
+      response_format: { type: "json_object" }
+    });
+
+    //----------------------------------------------------
+    // ⑤ JSON抽出（安全なパーサー）
+    //----------------------------------------------------
+    const parsed = safeParseJson_(gptResponse);
+    if (!parsed) {
+      replyToUser_(userId, "Day30の解析に失敗しました。再度お試しください。");
+      return;
+    }
+
+    //----------------------------------------------------
+    // ⑥ HTML生成（OSパターンを差し込む）
+    //----------------------------------------------------
+    const html = generateDay30HtmlReport_({
+      userId: userId,
+      osPatternName: parsed.osPatternName,
+      osPatternDescription: parsed.osPatternDescription,
+      factor1: parsed.factor1,
+      factor2: parsed.factor2,
+      factor3: parsed.factor3,
+      factor4: parsed.factor4,
+      factor5: parsed.factor5,
+      day24to29: dayData,
+      day30: day30,
+      personal: personal,
+      valueFormingYear: valueFormingYear
+    });
+
+    //----------------------------------------------------
+    // ⑦ PDF生成
+    //----------------------------------------------------
+    const pdfBlob = createDay30PdfFromHtml_(html);
+
+    //----------------------------------------------------
+    // ⑧ LINEへPDF送信
+    //----------------------------------------------------
+    sendDay30ReportPdf_(userId, pdfBlob);
+
+    //----------------------------------------------------
+    // ⑨ 完了メッセージ
+    //----------------------------------------------------
+    replyToUser_(userId, "Day30診断レポートの生成が完了しました。📘");
+
+  } catch (e) {
+    Logger.log("❌ processDay30SummaryAnalysis Error: " + e);
+    replyToUser_(userId, "Day30レポート生成中にエラーが発生しました。");
+  }
+}
+
+/************************************************************
+ * 55. generateOsPatternPrompt_（Day30 OSパターン解析プロンプト生成）
+ *  - Day24〜29の構造データ
+ *  - Day30（差分と現在地）
+ *  - 初期現象（Day1〜3のログがあれば）
+ *  - 個人情報（MBTI／出生年／14歳時の背景）
+ *  を統合して GPT に渡すプロンプトを生成する
+ ************************************************************/
+function generateOsPatternPrompt_(payload) {
+
+  const { day24to29, day30, initialObservation,
+          valueFormingYear, userPersonalInfo } = payload;
+
+  const mbti    = userPersonalInfo?.mbti || "";
+  const birth   = userPersonalInfo?.birthYear || "";
+  const job     = userPersonalInfo?.occupation || "";
+
+  return `
+あなたは「認知OSの構造解析エンジン」です。
+以下の30日間データから、ユーザーの思考OSパターンを構造的に抽出してください。
+
+【出力形式（必ずJSON）】
+{
+  "osPatternName": "",
+  "osPatternDescription": "",
+
+  "factor1": "",
+  "factor2": "",
+  "factor3": "",
+  "factor4": "",
+  "factor5": ""
+}
+
+【OSパターン名の要件】
+- MBTI名や16タイプの名前は禁止
+- 無料診断のような表現は禁止
+- 以下のような概念名にする：
+  - 構造先行型（Structure-First）
+  - 意味探索型（Meaning-Seeker）
+  - 予測回路優位（Future-Projection）
+  - 整合性駆動（Consistency-Driven）
+  - 感覚帰着型（Sensory-Grounded）
+- Noubitoの理念（“壁を薄くする”）からズレない抽象度
+
+【OSパターンの説明文】
+- 「特性の長所／短所」ではなく OS構造として記述
+- “どう反応が生成されているか”にフォーカスする
+- 行動・反応・視点の連鎖を中心に説明する
+
+【5分類の定義】
+1. 資質構造：  
+   - どんなOS配線で思考が生成されているか
+   - Day24〜29の傾向を中心にモデル化
+
+2. 内的矛盾とズレ：  
+   - 理想文（Day14〜17）とDay24〜29の行動／視点のズレ構造
+   - Noubitoの「差分可視化」原則に基づく
+
+3. 変化と起源：  
+   - Day30の“初期現象→変化”から因果連鎖を抽出
+   - valueFormingYear（出生＋14）も分析に使用
+
+4. 自己認識：  
+   - メタ認知の癖、見落としやすい盲点
+   - 反応のクセ・重力圏（dominantLayer）
+
+5. 留意点：  
+   - 注意点ではなく「壁を薄くするための小さな最適化」
+   - 行動指示を出さない。OS調整ポイントを書く。
+
+-----------------------------------------
+【入力データ】
+■ Day24〜29（構造領域）
+${JSON.stringify(day24to29, null, 2)}
+
+■ Day30（差分と現在地）
+${JSON.stringify(day30, null, 2)}
+
+■ 初期現象
+${initialObservation}
+
+■ MBTI（任意）
+${mbti}
+
+■ 出生年
+${birth}
+
+■ 価値観形成期（出生＋14）
+${valueFormingYear}
+
+■ 職業
+${job}
+-----------------------------------------
+
+上記すべてを元に、必ず「JSONのみ」で出力してください。
+`;
+}
+
+
 
