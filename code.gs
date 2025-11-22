@@ -2450,27 +2450,29 @@ function generateDay30HtmlReport(reportData) {
   const html = templateFile.evaluate().getContent();
   return html;
 }
-{
-  title: "",
-  typeName: "",
-  typeDescription: "",
+function processDay30SummaryAnalysis(userId) {
+  const reportData = {
+    title: "",
+    typeName: "",
+    typeDescription: "",
+    scoreSection: "",
+    dominantLayer: "",
+    thinkingType: "",
+    conflictSection: "",
+    shiftSection: "",
+    valueFormingBackground: "",
+    finalTips: "",
+    osPatternName: "",
+    osPatternDescription: "",
+    viewpointChartBase64: "",
+    cardsHtml: "",
+    prefaceHtml: "",
+    outroHtml: ""
+  };
 
-  scoreSection: "",
-  dominantLayer: "",
-  thinkingType: "",
-  conflictSection: "",
-  shiftSection: "",
-  valueFormingBackground: "",
-  finalTips: "",
-
-  osPatternName: "",
-  osPatternDescription: "",
-
-  viewpointChartBase64: "",
-  cardsHtml: "",
-  prefaceHtml: "",
-  outroHtml: ""
+  // （このあと reportData.xxx に値を入れていく）
 }
+
 /************************************************************
  * 25. createDay30PdfFromHtml
  * HTML → PDF（スマホ縦長対応）を生成し、Driveに保存
