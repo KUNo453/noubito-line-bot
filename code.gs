@@ -1,4 +1,35 @@
 /************************************************************
+ * PART 1: スプレッドシート設定
+ ************************************************************/
+const SHEET_ID = "1TKQKKMk5I8qK-0hWCuRKaRbb2Pc7BEeH299p2WakZiI";
+const SHEET_NAME = "回答";
+
+/************************************************************
+ * PART 2: GET（フォーム表示）
+ ************************************************************/
+function doGet(e) {
+  return HtmlService.createHtmlOutputFromFile("day_form")
+    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
+}
+
+/************************************************************
+ * PART 3: POST（フォーム → スプレッドシート保存）
+ ************************************************************/
+function saveDayForm(data) {
+  const ss = SpreadsheetApp.openById(SHEET_ID);
+  const sh = ss.getSheetByName(SHEET_NAME);
+
+  sh.appendRow([
+    data.userId || "web-user",
+    Number(data.day),
+    data.text,
+    new Date()
+  ]);
+
+  return "ok";
+}
+
+/************************************************************
  * PART 0: 共通設定・ユーティリティ（強化版）
  ************************************************************/
 const PROP = (() => {
