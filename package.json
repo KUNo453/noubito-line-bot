@@ -1,17 +1,11 @@
 {
-  "name": "noubito-line-webhook",
+  "name": "noubito-line-bot",
   "version": "1.0.0",
-  "private": true,
-  "description": "LINE webhook for Noubito (Cloud Run)",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
-  "engines": {
-    "node": ">=18"
-  },
   "dependencies": {
-    "@line/bot-sdk": "^9.6.0",
-    "express": "^4.19.2"
+    "express": "^4.18.2"
   }
 }
