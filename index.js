@@ -12,7 +12,8 @@ app.get("/", (req, res) => {
 
 // LINE webhook（とりあえず200返す）
 app.post("/webhook", (req, res) => {
-  console.log("Webhook received");
+  console.log("=== WEBHOOK HIT ===");
+  console.log(JSON.stringify(req.body, null, 2));
   res.status(200).send("OK");
 });
 
