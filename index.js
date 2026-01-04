@@ -32,29 +32,38 @@ function verifySignature(req) {
 
 /* ===== GASへ転送 ===== */
 async function forwardToGAS(payload) {
-  await fetch(GAS_WEBAPP_URL, {
+  console.log(">>> forwardToGAS(): POST start");
+
+  const res = await fetch(GAS_WEBAPP_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
   });
+
+  console.log(">>> forwardToGAS(): POST done", res.status);
 }
 
 /* ===== Webhook ===== */
 app.post("/webhook", async (req, res) => {
   try {
+    /* 署名検証 */
     if (!verifySignature(req)) {
-      console.error("Invalid LINE signature");
+      console.error("❌ Invalid LINE signature");
       return res.status(401).send("Invalid signature");
     }
 
+    /* LINEから届いたことの確認 */
     console.log("=== LINE WEBHOOK HIT ===");
     console.log(JSON.stringify(req.body, null, 2));
 
+    /* GASへ送信（ここが確認ポイント） */
+    console.log(">>> SEND TO GAS start");
     await forwardToGAS(req.body);
+    console.log(">>> SEND TO GAS done");
 
     res.status(200).send("OK");
   } catch (err) {
-    console.error("Webhook error:", err);
+    console.error("❌ Webhook error:", err);
     res.status(500).send("Internal Server Error");
   }
 });
