@@ -30,17 +30,32 @@ function verifySignature(req) {
   return hash === signature;
 }
 
-/* ===== GASへ転送 ===== */
+/* ===== GASへ転送（payload 一切加工しない） ===== */
 async function forwardToGAS(payload) {
   console.log(">>> forwardToGAS(): POST start");
+
+  // ★ 観測用（replyToken が存在するか）
+  try {
+    const rt = payload?.events?.[0]?.replyToken;
+    console.log(">>> replyToken visible:", rt || "NOT FOUND");
+  } catch (_) {
+    console.log(">>> replyToken parse failed");
+  }
 
   const res = await fetch(GAS_WEBAPP_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
+    body: JSON.stringify(payload), // ← 一切加工していない
   });
 
-  console.log(">>> forwardToGAS(): POST done", res.status);
+  const text = await res.text();
+
+  console.log(">>> forwardToGAS(): status =", res.status);
+  console.log(">>> forwardToGAS(): response =", text);
+
+  if (!res.ok) {
+    throw new Error(`GAS returned ${res.status}`);
+  }
 }
 
 /* ===== Webhook ===== */
@@ -52,11 +67,10 @@ app.post("/webhook", async (req, res) => {
       return res.status(401).send("Invalid signature");
     }
 
-    /* LINEから届いたことの確認 */
     console.log("=== LINE WEBHOOK HIT ===");
     console.log(JSON.stringify(req.body, null, 2));
 
-    /* GASへ送信（ここが確認ポイント） */
+    /* GASへ送信 */
     console.log(">>> SEND TO GAS start");
     await forwardToGAS(req.body);
     console.log(">>> SEND TO GAS done");
