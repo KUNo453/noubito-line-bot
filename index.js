@@ -1,14 +1,22 @@
+/************************************************************
+ * LINE Webhook 中継サーバー（Cloud Run）
+ * 役割：
+ *  - LINE Webhook を即 200 OK で受ける
+ *  - 署名検証は行う（ただし失敗でも 200）
+ *  - payload をそのまま GAS WebApp に転送
+ ************************************************************/
+
 const express = require("express");
 const crypto = require("crypto");
 const fetch = require("node-fetch");
 
 const app = express();
 
-/* ===== env ===== */
+/* ===== 環境変数 ===== */
 const LINE_CHANNEL_SECRET = process.env.LINE_CHANNEL_SECRET;
 const GAS_WEBAPP_URL = process.env.GAS_WEBAPP_URL;
 
-/* ===== rawBody ===== */
+/* ===== rawBody を保持（署名検証用） ===== */
 app.use(
   express.json({
     verify: (req, res, buf) => {
@@ -17,7 +25,7 @@ app.use(
   })
 );
 
-/* ===== signature ===== */
+/* ===== LINE署名検証 ===== */
 function verifySignature(req) {
   const signature = req.headers["x-line-signature"];
   if (!signature) return false;
@@ -30,35 +38,38 @@ function verifySignature(req) {
   return hash === signature;
 }
 
-/* ===== webhook ===== */
+/* ===== Webhook ===== */
 app.post("/webhook", async (req, res) => {
-  // ★ LINE検証対策：何が来ても即200
-  if (!req.headers["x-line-signature"]) {
-    return res.status(200).send("OK");
-  }
-
-  // ★ 署名不正でも200（検証通すため）
-  if (!verifySignature(req)) {
-    return res.status(200).send("OK");
-  }
-
-  // ★ ここで即200返す（最重要）
+  // ===== ① 何が来ても即 200 OK（最重要） =====
   res.status(200).send("OK");
 
-  // ↓ 以降は非同期でOK（失敗してもLINEは成功扱い）
+  // ===== ② ログ（userId確認用） =====
   try {
+    console.log("=== LINE WEBHOOK BODY ===");
+    console.log(JSON.stringify(req.body, null, 2));
+  } catch (_) {}
+
+  // ===== ③ 署名が無い／不正でも処理は止めない =====
+  try {
+    if (!verifySignature(req)) {
+      console.warn("Invalid or missing LINE signature");
+      return;
+    }
+
+    // ===== ④ GAS に payload をそのまま転送 =====
     await fetch(GAS_WEBAPP_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(req.body),
     });
-  } catch (e) {
-    console.error("GAS forward error", e);
+
+  } catch (err) {
+    console.error("Forward to GAS failed:", err);
   }
 });
 
-/* ===== start ===== */
+/* ===== サーバー起動 ===== */
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
-  console.log(`Server running on ${PORT}`);
+  console.log(`Server running on port ${PORT}`);
 });
